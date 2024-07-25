@@ -24,7 +24,7 @@ def main(
     model: Annotated[str, typer.Option("--model", "-m")] = "models/7B/ggml-model-f16.gguf",
     template_hf_model_id_fallback: Annotated[Optional[str], typer.Option(help="If the GGUF model does not contain a chat template, get it from this HuggingFace tokenizer")] = 'meta-llama/Llama-2-7b-chat-hf',
     # model_url: Annotated[Optional[str], typer.Option("--model-url", "-mu")] = None,
-    host: str = os.environ['HOST'] if 'HOST' in os.environ else "0.0.0.0",
+    host: str = os.environ.get('HOST') if 'HOST' in os.environ else "0.0.0.0",
     port: int = 8080,
     parallel_calls: bool = False,
     style: Optional[ToolsPromptStyle] = None,
@@ -67,7 +67,7 @@ def main(
             "--host", server_host, "--port", f'{server_port}',
             # TODO: pass these from JSON / BaseSettings?
             #'-ctk', 'q4_0', '-ctv', 'f16',
-            "-c", "16384", "-ngl", "0", "-t", "8",
+            "-c", os.environ.get('CTX'), "-ngl", os.environ.get('GPULAYERS'), "-t", os.environ.get('THREADS'),
             *([] if verbose else ["--log-disable"]),
         ]
 
