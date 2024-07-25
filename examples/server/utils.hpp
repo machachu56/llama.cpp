@@ -6,11 +6,13 @@
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
 #include "json.hpp"
+#include "json-schema-to-grammar.h"
 
 #include <string>
 #include <vector>
 #include <sstream>
 #include <random>
+#include <regex>
 
 #define DEFAULT_OAICOMPAT_MODEL "gpt-3.5-turbo-0613"
 
@@ -117,18 +119,45 @@ static inline void server_log(const char * level, const char * function, int lin
 //
 
 // Format given chat. If tmpl is empty, we take the template from model metadata
-inline std::string format_chat(const struct llama_model * model, const std::string & tmpl, const std::vector<json> & messages) {
-    std::vector<llama_chat_msg> chat;
+inline std::string format_chat(const struct llama_model * model, const std::string & tmpl, const std::vector<json> & messages, const std::string & extra_system_message) {
+    size_t alloc_size = 0;
+    // vector holding all allocated string to be passed to llama_chat_apply_template
+    std::vector<std::string> str(messages.size() * 2);
+    std::vector<llama_chat_message> chat(messages.size());
 
     for (size_t i = 0; i < messages.size(); ++i) {
         const auto & curr_msg = messages[i];
-        std::string role    = json_value(curr_msg, "role",    std::string(""));
-        std::string content = json_value(curr_msg, "content", std::string(""));
-        chat.push_back({role, content});
+        str[i*2 + 0]    = json_value(curr_msg, "role",    std::string(""));
+        str[i*2 + 1]    = json_value(curr_msg, "content", std::string(""));
+        alloc_size     += str[i*2 + 1].length();
+        chat[i].role    = str[i*2 + 0].c_str();
+        chat[i].content = str[i*2 + 1].c_str();
     }
 
-    auto formatted_chat = llama_chat_apply_template(model, tmpl, chat, true);
+    if (!extra_system_message.empty()) {
+        alloc_size += extra_system_message.size();
+
+        llama_chat_message msg { "system", extra_system_message.c_str() };
+        chat.insert(chat.begin(), msg);
+        // chat.push_back(msg);
+    }
+
+    const char * ptr_tmpl = tmpl.empty() ? nullptr : tmpl.c_str();
+    std::vector<char> buf(alloc_size * 2);
+
+    // run the first time to get the total output length
+    int32_t res = llama_chat_apply_template(model, ptr_tmpl, chat.data(), chat.size(), true, buf.data(), buf.size());
+
+    // if it turns out that our buffer is too small, we resize it
+    if ((size_t) res > buf.size()) {
+        buf.resize(res);
+        res = llama_chat_apply_template(model, ptr_tmpl, chat.data(), chat.size(), true, buf.data(), buf.size());
+    }
+
+    const std::string formatted_chat(buf.data(), res);
+
     LOG_VERBOSE("formatted_chat", {{"text", formatted_chat.c_str()}});
+
     return formatted_chat;
 }
 
@@ -355,8 +384,9 @@ static json oaicompat_completion_params_parse(
     llama_params["temperature"]       = json_value(body,   "temperature",       1.0);
     llama_params["top_p"]             = json_value(body,   "top_p",             1.0);
 
+    std::string extra_system_message;
     // Apply chat template to the list of messages
-    llama_params["prompt"] = format_chat(model, chat_template, body.at("messages"));
+    llama_params["prompt"] = format_chat(model, chat_template, body.at("messages"), extra_system_message);
 
     // Handle "stop" field
     if (body.contains("stop") && body.at("stop").is_string()) {
@@ -371,9 +401,61 @@ static json oaicompat_completion_params_parse(
         std::string response_type = json_value(response_format, "type", std::string());
         if (response_type == "json_object") {
             llama_params["json_schema"] = json_value(response_format, "schema", json::object());
+            extra_system_message = (std::stringstream()
+                << "You are a helpful assistant that answers in JSON. Here's the json schema you must adhere to:\n<schema>\n"
+                << llama_params["json_schema"].dump().c_str() 
+                << "\n</schema>"
+            ).str();
         } else if (!response_type.empty() && response_type != "text") {
             throw std::runtime_error("response_format type must be one of \"text\" or \"json_object\", but got: " + response_type);
         }
+    } else if (body.contains("tools") && body["tools"].is_array()) {
+        const auto & tools = body["tools"];
+        bool built_grammar = false;
+        bool allow_parallel_calls = false;
+        bool allow_content = true;
+        if (body.contains("tool_choice") && body["tool_choice"].is_string() && body["tool_choice"] != "auto") {
+            std::string tool_choice = body["tool_choice"];
+            if (tool_choice == "required") {
+                allow_content = false;
+            } else {
+                for (const auto & tool : tools) {
+                    if (tool["name"] == tool_choice) {
+                        llama_params["grammar"] = tool_call_grammar(json::array({ tool }), allow_parallel_calls, /* allow_content= */ false);
+                        built_grammar = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!built_grammar) {
+            llama_params["grammar"] = tool_call_grammar(tools, allow_parallel_calls, allow_content);
+        }
+        // TODO: pass a template file.
+        extra_system_message = (std::stringstream()
+            << "You are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags. "
+            << "You may call one or more functions to assist with the user query. "
+            // << "Don't make assumptions about what values to plug into functions. "
+            << "Here are the available tools: <tools>"
+            << tools.dump(2).c_str()
+            << "</tools>\n"
+            // << "To call a tool give a json object with function name and arguments within <tool_call></tool_call> XML tags as follows:"
+            << "For each function call return a json object with function name and arguments within <tool_call></tool_call> XML tags as follows:"
+            << "<tool_call>"
+            << "{\"name\": <function-name>, \"arguments\": <args-dict>}"
+            << "</tool_call>"
+            << "Don't explain which tools you're going to call, just call them."
+        ).str();
+    }
+
+    // Apply chat template to the list of messages
+    llama_params["prompt"] = format_chat(model, chat_template, body["messages"], extra_system_message);
+
+    // Handle "stop" field
+    if (body.contains("stop") && body["stop"].is_string()) {
+        llama_params["stop"] = json::array({body["stop"].get<std::string>()});
+    } else {
+        llama_params["stop"] = json_value(body, "stop", json::array());
     }
 
     // Handle "n" field
@@ -391,7 +473,7 @@ static json oaicompat_completion_params_parse(
     }
 
     // Params supported by OAI but unsupported by llama.cpp
-    static const std::vector<std::string> unsupported_params { "tools", "tool_choice" };
+    static const std::vector<std::string> unsupported_params;// { "tool_choice" };
     for (auto & param : unsupported_params) {
         if (body.contains(param)) {
             throw std::runtime_error("Unsupported param: " + param);
@@ -418,9 +500,35 @@ static json format_final_response_oaicompat(const json & request, json result, c
     int num_prompt_tokens    = json_value(result, "tokens_evaluated", 0);
     std::string content      = json_value(result, "content", std::string(""));
 
+
     std::string finish_reason = "length";
     if (stopped_word || stopped_eos) {
         finish_reason = "stop";
+    }
+    json tool_calls;
+    json message_content;
+    if (request.contains("tools")) {
+        std::regex pattern("<tool_call>(.*?)</tool_call>");
+        std::sregex_iterator iter(content.begin(), content.end(), pattern);
+        std::sregex_iterator end;
+        while (iter != end) {
+            std::smatch match = *iter;
+            auto call = json::parse(match[1].str());
+            if (tool_calls.is_null()) {
+                tool_calls = json::array();
+            }
+            tool_calls.push_back({
+                {"function", {
+                    {"name", call["name"]},
+                    {"arguments", call["arguments"].dump()},
+                }},
+            });
+            finish_reason = "tool_calls";
+            ++iter;
+        }
+    }
+    if (tool_calls.is_null()) {
+        message_content = content;
     }
 
     json choices =
@@ -429,7 +537,8 @@ static json format_final_response_oaicompat(const json & request, json result, c
                                         {"delta", json::object()}}})
                   : json::array({json{{"finish_reason", finish_reason},
                                         {"index", 0},
-                                        {"message", json{{"content", content},
+                                        {"message", json{{"content", message_content},
+                                                         {"tool_calls", tool_calls},
                                                          {"role", "assistant"}}}}});
 
     std::time_t t = std::time(0);

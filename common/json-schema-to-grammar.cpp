@@ -11,6 +11,9 @@
 
 using json = nlohmann::ordered_json;
 
+const char * DOTALL = "[\\U00000000-\\U0010FFFF]";
+const char * DOT = "[^\\x0A\\x0D]";
+
 template <typename Iterator>
 static std::string join(Iterator begin, Iterator end, const std::string & separator);
 
@@ -40,234 +43,7 @@ static std::string build_repetition(const std::string & item_rule, int min_items
     return result;
 }
 
-/* Minimalistic replacement for std::string_view, which is only available from C++17 onwards */
-class string_view {
-    const std::string & _str;
-    const size_t _start;
-    const size_t _end;
-public:
-    string_view(const std::string & str, size_t start = 0, size_t end  = std::string::npos) : _str(str), _start(start), _end(end == std::string::npos ? str.length() : end) {}
-
-    size_t size() const {
-        return _end - _start;
-    }
-
-    size_t length() const {
-        return size();
-    }
-
-    operator std::string() const {
-        return str();
-    }
-
-    std::string str() const {
-        return _str.substr(_start, _end - _start);
-    }
-
-    string_view substr(size_t pos, size_t len = std::string::npos) const {
-        return string_view(_str, _start + pos, len == std::string::npos ? _end : _start + pos + len);
-    }
-
-    char operator[](size_t pos) const {
-        auto index = _start + pos;
-        if (index >= _end) {
-            throw std::out_of_range("string_view index out of range");
-        }
-        return _str[_start + pos];
-    }
-
-    bool operator==(const string_view & other) const {
-        std::string this_str = *this;
-        std::string other_str = other;
-        return this_str == other_str;
-    }
-};
-
-static void _build_min_max_int(int min_value, int max_value, std::stringstream & out, int decimals_left = 16, bool top_level = true) {
-    auto has_min = min_value != std::numeric_limits<int>::min();
-    auto has_max = max_value != std::numeric_limits<int>::max();
-
-    auto digit_range = [&](char from, char to) {
-        out << "[";
-        if (from == to) {
-            out << from;
-        } else {
-            out << from << "-" << to;
-        }
-        out << "]";
-    };
-    auto more_digits = [&](int min_digits, int max_digits) {
-        out << "[0-9]";
-        if (min_digits == max_digits && min_digits == 1) {
-            return;
-        }
-        out << "{";
-        out << min_digits;
-        if (max_digits != min_digits) {
-            out << ",";
-            if (max_digits != std::numeric_limits<int>::max()) {
-                out << max_digits;
-            }
-        }
-        out << "}";
-    };
-    std::function<void(const string_view &, const string_view &)> uniform_range =
-        [&](const string_view & from, const string_view & to) {
-            size_t i = 0;
-            while (i < from.length() && i < to.length() && from[i] == to[i]) {
-                i++;
-            }
-            if (i > 0) {
-                out << "\"" << from.substr(0, i).str() << "\"";
-            }
-            if (i < from.length() && i < to.length()) {
-                if (i > 0) {
-                    out << " ";
-                }
-                auto sub_len = from.length() - i - 1;
-                if (sub_len > 0) {
-                    auto from_sub = from.substr(i + 1);
-                    auto to_sub = to.substr(i + 1);
-                    auto sub_zeros = repeat("0", sub_len);
-                    auto sub_nines = repeat("9", sub_len);
-
-                    auto to_reached = false;
-                    out << "(";
-                    if (from_sub == sub_zeros) {
-                        digit_range(from[i], to[i] - 1);
-                        out << " ";
-                        more_digits(sub_len, sub_len);
-                    } else {
-                        out << "[" << from[i] << "] ";
-                        out << "(";
-                        uniform_range(from_sub, sub_nines);
-                        out << ")";
-                        if (from[i] < to[i] - 1) {
-                            out << " | ";
-                            if (to_sub == sub_nines) {
-                                digit_range(from[i] + 1, to[i]);
-                                to_reached = true;
-                            } else {
-                                digit_range(from[i] + 1, to[i] - 1);
-                            }
-                            out << " ";
-                            more_digits(sub_len, sub_len);
-                        }
-                    }
-                    if (!to_reached) {
-                        out << " | ";
-                        digit_range(to[i], to[i]);
-                        out << " ";
-                        uniform_range(sub_zeros, to_sub);
-                    }
-                    out << ")";
-                } else {
-                    out << "[" << from[i] << "-" << to[i] << "]";
-                }
-            }
-        };
-
-    if (has_min && has_max) {
-        if (min_value < 0 && max_value < 0) {
-            out << "\"-\" (";
-            _build_min_max_int(-max_value, -min_value, out, decimals_left, /* top_level= */ true);
-            out << ")";
-            return;
-        }
-
-        if (min_value < 0) {
-            out << "\"-\" (";
-            _build_min_max_int(0, -min_value, out, decimals_left, /* top_level= */ true);
-            out << ") | ";
-            min_value = 0;
-        }
-
-        auto min_s = std::to_string(min_value);
-        auto max_s = std::to_string(max_value);
-        auto min_digits = min_s.length();
-        auto max_digits = max_s.length();
-
-        for (auto digits = min_digits; digits < max_digits; digits++) {
-            uniform_range(min_s, repeat("9", digits));
-            min_s = "1" + repeat("0", digits);
-            out << " | ";
-        }
-        uniform_range(min_s, max_s);
-        return;
-    }
-
-    auto less_decimals = std::max(decimals_left - 1, 1);
-
-    if (has_min) {
-        if (min_value < 0) {
-            out << "\"-\" (";
-            _build_min_max_int(std::numeric_limits<int>::min(), -min_value, out, decimals_left, /* top_level= */ false);
-            out << ") | [0] | [1-9] ";
-            more_digits(0, decimals_left - 1);
-        } else if (min_value == 0) {
-            if (top_level) {
-                out << "[0] | [1-9] ";
-                more_digits(0, less_decimals);
-            } else {
-                more_digits(1, decimals_left);
-            }
-        } else if (min_value <= 9) {
-            char c = '0' + min_value;
-            auto range_start = top_level ? '1' : '0';
-            if (c > range_start) {
-                digit_range(range_start, c - 1);
-                out << " ";
-                more_digits(1, less_decimals);
-                out << " | ";
-            }
-            digit_range(c, '9');
-            out << " ";
-            more_digits(0, less_decimals);
-        } else {
-            auto min_s = std::to_string(min_value);
-            auto len = min_s.length();
-            auto c = min_s[0];
-
-            if (c > '1') {
-                digit_range(top_level ? '1' : '0', c - 1);
-                out << " ";
-                more_digits(len, less_decimals);
-                out << " | ";
-            }
-            digit_range(c, c);
-            out << " (";
-            _build_min_max_int(std::stoi(min_s.substr(1)), std::numeric_limits<int>::max(), out, less_decimals, /* top_level= */ false);
-            out << ")";
-            if (c < '9') {
-                out << " | ";
-                digit_range(c + 1, '9');
-                out << " ";
-                more_digits(len - 1, less_decimals);
-            }
-        }
-        return;
-    }
-
-    if (has_max) {
-        if (max_value >= 0) {
-            if (top_level) {
-                out << "\"-\" [1-9] ";
-                more_digits(0, less_decimals);
-                out << " | ";
-            }
-            _build_min_max_int(0, max_value, out, decimals_left, /* top_level= */ true);
-        } else {
-            out << "\"-\" (";
-            _build_min_max_int(-max_value, std::numeric_limits<int>::max(), out, decimals_left, /* top_level= */ false);
-            out << ")";
-        }
-        return;
-    }
-
-    throw std::runtime_error("At least one of min_value or max_value must be set");
-}
-
-const std::string SPACE_RULE = "| \" \" | \"\\n\" [ \\t]{0,20}";
+const std::string SPACE_RULE = "\" \"?";
 
 struct BuiltinRule {
     std::string content;
@@ -284,7 +60,7 @@ std::unordered_map<std::string, BuiltinRule> PRIMITIVE_RULES = {
     {"object", {"\"{\" space ( string \":\" space value (\",\" space string \":\" space value)* )? \"}\" space", {"string", "value"}}},
     {"array", {"\"[\" space ( value (\",\" space value)* )? \"]\" space", {"value"}}},
     {"uuid", {"\"\\\"\" [0-9a-fA-F]{8} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{12} \"\\\"\" space", {}}},
-    {"char",   {"[^\"\\\\\\x7F\\x00-\\x1F] | [\\\\] ([\"\\\\bfnrt] | \"u\" [0-9a-fA-F]{4})", {}}},
+    {"char",   {"[^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F]{4})", {}}},
     {"string", {"\"\\\"\" char* \"\\\"\" space", {"char"}}},
     {"null", {"\"null\" space", {}}},
 };
@@ -316,7 +92,7 @@ std::unordered_map<char, std::string> GRAMMAR_LITERAL_ESCAPES = {
 };
 
 std::unordered_set<char> NON_LITERAL_SET = {'|', '.', '(', ')', '[', ']', '{', '}', '*', '+', '?'};
-std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
+std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
 
 template <typename Iterator>
 std::string join(Iterator begin, Iterator end, const std::string & separator) {
@@ -387,6 +163,30 @@ static std::string format_literal(const std::string & literal) {
     return "\"" + escaped + "\"";
 }
 
+/*
+    not_literal('a') -> '[^a]'
+    not_literal('abc') -> '([^a] | "a" ([^b] | "b" ([^c])?)?)?'
+*/
+// static std::string not_literal(const std::string & literal, bool dotall = true) {
+//     assert(literal.size() > 0);
+//     std::stringstream out;
+//     std::function<void(int)> recurse = [&](size_t i) {
+//         const char & c = literal[i];
+//         out << "[^" << c << "]";
+//         out << " " << (dotall ? DOTALL : DOT) << "*";
+//         if (i < literal.size() - 1) {
+//             out << " | " << format_literal(literal.substr(i, 1)) << " (";
+//             recurse(i + 1);
+//             out << ")?";
+//         }
+//     };
+//     out << "(";
+//     recurse(0);
+//     out << ")";
+//     return out.str();
+// }
+
+
 class SchemaConverter {
 private:
     std::function<json(const std::string &)> _fetch_json;
@@ -396,22 +196,6 @@ private:
     std::unordered_set<std::string> _refs_being_resolved;
     std::vector<std::string> _errors;
     std::vector<std::string> _warnings;
-
-    std::string _add_rule(const std::string & name, const std::string & rule) {
-        std::string esc_name = regex_replace(name, INVALID_RULE_CHARS_RE, "-");
-        if (_rules.find(esc_name) == _rules.end() || _rules[esc_name] == rule) {
-            _rules[esc_name] = rule;
-            return esc_name;
-        } else {
-            int i = 0;
-            while (_rules.find(esc_name + std::to_string(i)) != _rules.end() && _rules[esc_name + std::to_string(i)] != rule) {
-                i++;
-            }
-            std::string key = esc_name + std::to_string(i);
-            _rules[key] = rule;
-            return key;
-        }
-    }
 
     std::string _generate_union_rule(const std::string & name, const std::vector<json> & alt_schemas) {
         std::vector<std::string> rules;
@@ -445,11 +229,11 @@ private:
             auto get_dot = [&]() {
                 std::string rule;
                 if (_dotall) {
-                    rule = "[\\U00000000-\\U0010FFFF]";
+                    rule = DOTALL;
                 } else {
-                    rule = "[^\\x0A\\x0D]";
+                    rule = DOT;
                 }
-                return _add_rule("dot", rule);
+                return add_rule("dot", rule);
             };
 
             // Joins the sequence, merging consecutive literals together.
@@ -566,7 +350,7 @@ private:
                     if (!sub_is_literal) {
                         std::string & sub_id = sub_rule_ids[sub];
                         if (sub_id.empty()) {
-                            sub_id = _add_rule(name + "-" + std::to_string(sub_rule_ids.size()), sub);
+                            sub_id = add_rule(name + "-" + std::to_string(sub_rule_ids.size()), sub);
                         }
                         sub = sub_id;
                     }
@@ -611,76 +395,7 @@ private:
             }
             return join_seq();
         };
-        return _add_rule(name, "\"\\\"\" " + to_rule(transform()) + " \"\\\"\" space");
-    }
-
-    /*
-        Returns a rule that matches a JSON string that is none of the provided strings
-
-        not_strings({"a"})
-            -> ["] ( [a] char+ | [^"a] char* )? ["] space
-        not_strings({"and", "also"})
-            -> ["] ( [a] ([l] ([s] ([o] char+ | [^"o] char*) | [^"s] char*) | [n] ([d] char+ | [^"d] char*) | [^"ln] char*) | [^"a] char* )? ["] space
-    */
-    std::string _not_strings(const std::vector<std::string> & strings) {
-
-        struct TrieNode {
-            std::map<char, TrieNode> children;
-            bool is_end_of_string;
-
-            TrieNode() : is_end_of_string(false) {}
-
-            void insert(const std::string & string) {
-                auto node = this;
-                for (char c : string) {
-                    node = &node->children[c];
-                }
-                node->is_end_of_string = true;
-            }
-        };
-
-        TrieNode trie;
-        for (const auto & s : strings) {
-            trie.insert(s);
-        }
-
-        std::string char_rule = _add_primitive("char", PRIMITIVE_RULES.at("char"));
-        std::ostringstream out;
-        out << "[\"] ( ";
-        std::function<void(const TrieNode &)> visit = [&](const TrieNode & node) {
-            std::ostringstream rejects;
-            auto first = true;
-            for (const auto & kv : node.children) {
-                rejects << kv.first;
-                if (first) {
-                    first = false;
-                } else {
-                    out << " | ";
-                }
-                out << "[" << kv.first << "]";
-                if (!kv.second.children.empty()) {
-                    out << " (";
-                    visit(kv.second);
-                    out << ")";
-                } else if (kv.second.is_end_of_string) {
-                    out << " " << char_rule << "+";
-                }
-            }
-            if (!node.children.empty()) {
-                if (!first) {
-                    out << " | ";
-                }
-                out << "[^\"" << rejects.str() << "] " << char_rule << "*";
-            }
-        };
-        visit(trie);
-
-        out << " )";
-        if (!trie.is_end_of_string) {
-            out << "?";
-        }
-        out << " [\"] space";
-        return out.str();
+        return add_rule(name, "\"\\\"\" " + to_rule(transform()) + " \"\\\"\" space");
     }
 
     std::string _resolve_ref(const std::string & ref) {
@@ -703,13 +418,12 @@ private:
         std::vector<std::string> required_props;
         std::vector<std::string> optional_props;
         std::unordered_map<std::string, std::string> prop_kv_rule_names;
-        std::vector<std::string> prop_names;
         for (const auto & kv : properties) {
             const auto &prop_name = kv.first;
             const auto &prop_schema = kv.second;
 
             std::string prop_rule_name = visit(prop_schema, name + (name.empty() ? "" : "-") + prop_name);
-            prop_kv_rule_names[prop_name] = _add_rule(
+            prop_kv_rule_names[prop_name] = add_rule(
                 name + (name.empty() ? "" : "-") + prop_name + "-kv",
                 format_literal(json(prop_name).dump()) + " space \":\" space " + prop_rule_name
             );
@@ -718,18 +432,11 @@ private:
             } else {
                 optional_props.push_back(prop_name);
             }
-            prop_names.push_back(prop_name);
         }
-        if ((additional_properties.is_boolean() && additional_properties.get<bool>()) || additional_properties.is_object()) {
+        if (additional_properties.is_object() || (additional_properties.is_boolean() && additional_properties.get<bool>())) {
             std::string sub_name = name + (name.empty() ? "" : "-") + "additional";
-            std::string value_rule =
-                additional_properties.is_object() ? visit(additional_properties, sub_name + "-value")
-                : _add_primitive("value", PRIMITIVE_RULES.at("value"));
-
-            auto key_rule =
-                prop_names.empty() ? _add_primitive("string", PRIMITIVE_RULES.at("string"))
-                : _add_rule(sub_name + "-k", _not_strings(prop_names));
-            std::string kv_rule = _add_rule(sub_name + "-kv", key_rule + " \":\" space " + value_rule);
+            std::string value_rule = visit(additional_properties.is_object() ? additional_properties : json::object(), sub_name + "-value");
+            std::string kv_rule = add_rule(sub_name + "-kv", _add_primitive("string", PRIMITIVE_RULES.at("string")) + " \":\" space " + value_rule);
             prop_kv_rule_names["*"] = kv_rule;
             optional_props.push_back("*");
         }
@@ -755,14 +462,18 @@ private:
                 }
                 std::string k = ks[0];
                 std::string kv_rule_name = prop_kv_rule_names[k];
-                std::string comma_ref = "( \",\" space " + kv_rule_name + " )";
-                if (first_is_optional) {
-                    res = comma_ref + (k == "*" ? "*" : "?");
+                if (k == "*") {
+                    res = add_rule(
+                        name + (name.empty() ? "" : "-") + "additional-kvs",
+                        kv_rule_name + " ( \",\" space " + kv_rule_name + " )*"
+                    );
+                } else if (first_is_optional) {
+                    res = "( \",\" space " + kv_rule_name + " )?";
                 } else {
-                    res = kv_rule_name + (k == "*" ? " " + comma_ref + "*" : "");
+                    res = kv_rule_name;
                 }
                 if (ks.size() > 1) {
-                    res += " " + _add_rule(
+                    res += " " + add_rule(
                         name + (name.empty() ? "" : "-") + k + "-rest",
                         get_recursive_refs(std::vector<std::string>(ks.begin() + 1, ks.end()), true)
                     );
@@ -788,7 +499,7 @@ private:
     }
 
     std::string _add_primitive(const std::string & name, const BuiltinRule & rule) {
-        auto n = _add_rule(name, rule.content);
+        auto n = add_rule(name, rule.content);
         for (const auto & dep : rule.deps) {
             BuiltinRule dep_rule;
             auto it = PRIMITIVE_RULES.find(dep);
@@ -876,6 +587,62 @@ public:
         visit_refs(schema);
     }
 
+/*
+    reply ::= prefix tool-call*
+
+    prefix ::= [^<] prefix
+                | "<" [^t] prefix
+                | "<t" [^o] prefix
+                | "<to" [^o] prefix
+                | "<too" [^l] prefix
+                | "<tool" [^_] prefix
+                | "<tool_" [^c] prefix
+                | "<tool_c" [^a] prefix
+                | "<tool_ca" [^l] prefix
+                | "<tool_cal" [^l] prefix
+                | "<tool_call" [^l] prefix
+                | "<tool_call" [^>] prefix
+                |
+
+*/
+
+    std::string not_literal(const std::string & literal) {
+        auto rule_name = _find_rule_name("not" + literal, "!!!");
+        std::stringstream out;
+        for (size_t i = 0, n = literal.size(); i < n; i++) {
+            out << " | ";
+            if (i > 0) {
+                out << format_literal(literal.substr(0, i)) << " ";
+            }
+            out << "[^" << literal[i] << "] " << rule_name.c_str();
+        }
+        _rules[rule_name] = out.str();
+        return rule_name;
+    }
+
+    std::string _escape_name(const std::string & name) {
+        return regex_replace(name, INVALID_RULE_CHARS_RE, "-");
+    }
+    std::string _find_rule_name(const std::string & name, const std::string & rule) {
+        auto esc_name = _escape_name(name);
+        int i = 0;
+        while (_rules.find(esc_name + std::to_string(i)) != _rules.end() && _rules[esc_name + std::to_string(i)] != rule) {
+            i++;
+        }
+        return esc_name + std::to_string(i);
+    }
+    std::string add_rule(const std::string & name, const std::string & rule) {
+        auto esc_name = _escape_name(name);
+        if (_rules.find(esc_name) == _rules.end() || _rules[esc_name] == rule) {
+            _rules[esc_name] = rule;
+            return esc_name;
+        } else {
+            auto key = _find_rule_name(esc_name, rule);
+            _rules[key] = rule;
+            return key;
+        }
+    }
+
     std::string _generate_constant_rule(const json & value) {
         return format_literal(value.dump());
     }
@@ -886,26 +653,24 @@ public:
         std::string rule_name = is_reserved_name(name) ? name + "-" : name.empty() ? "root" : name;
 
         if (schema.contains("$ref")) {
-            return _add_rule(rule_name, _resolve_ref(schema["$ref"]));
+            return add_rule(rule_name, _resolve_ref(schema["$ref"]));
         } else if (schema.contains("oneOf") || schema.contains("anyOf")) {
             std::vector<json> alt_schemas = schema.contains("oneOf") ? schema["oneOf"].get<std::vector<json>>() : schema["anyOf"].get<std::vector<json>>();
-            return _add_rule(rule_name, _generate_union_rule(name, alt_schemas));
+            return add_rule(rule_name, _generate_union_rule(name, alt_schemas));
         } else if (schema_type.is_array()) {
             std::vector<json> schema_types;
             for (const auto & t : schema_type) {
-                json schema_copy(schema);
-                schema_copy["type"] = t;
-                schema_types.push_back(schema_copy);
+                schema_types.push_back({{"type", t}});
             }
-            return _add_rule(rule_name, _generate_union_rule(name, schema_types));
+            return add_rule(rule_name, _generate_union_rule(name, schema_types));
         } else if (schema.contains("const")) {
-            return _add_rule(rule_name, _generate_constant_rule(schema["const"]) + " space");
+            return add_rule(rule_name, _generate_constant_rule(schema["const"]));
         } else if (schema.contains("enum")) {
             std::vector<std::string> enum_values;
             for (const auto & v : schema["enum"]) {
                 enum_values.push_back(_generate_constant_rule(v));
             }
-            return _add_rule(rule_name, "(" + join(enum_values.begin(), enum_values.end(), " | ") + ") space");
+            return add_rule(rule_name, join(enum_values.begin(), enum_values.end(), " | "));
         } else if ((schema_type.is_null() || schema_type == "object")
                 && (schema.contains("properties") ||
                     (schema.contains("additionalProperties") && schema["additionalProperties"] != true))) {
@@ -923,7 +688,7 @@ public:
                     properties.emplace_back(prop.key(), prop.value());
                 }
             }
-            return _add_rule(rule_name,
+            return add_rule(rule_name,
                 _build_object_rule(
                     properties, required, name,
                     schema.contains("additionalProperties") ? schema["additionalProperties"] : json()));
@@ -954,7 +719,7 @@ public:
                     add_component(t, true);
                 }
             }
-            return _add_rule(rule_name, _build_object_rule(properties, required, hybrid_name, json()));
+            return add_rule(rule_name, _build_object_rule(properties, required, hybrid_name, json()));
         } else if ((schema_type.is_null() || schema_type == "array") && (schema.contains("items") || schema.contains("prefixItems"))) {
             json items = schema.contains("items") ? schema["items"] : schema["prefixItems"];
             if (items.is_array()) {
@@ -966,14 +731,14 @@ public:
                     rule += visit(items[i], name + (name.empty() ? "" : "-") + "tuple-" + std::to_string(i));
                 }
                 rule += " \"]\" space";
-                return _add_rule(rule_name, rule);
+                return add_rule(rule_name, rule);
             } else {
                 std::string item_rule_name = visit(items, name + (name.empty() ? "" : "-") + "item");
                 int min_items = schema.contains("minItems") ? schema["minItems"].get<int>() : 0;
                 json max_items_json = schema.contains("maxItems") ? schema["maxItems"] : json();
                 int max_items = max_items_json.is_number_integer() ? max_items_json.get<int>() : std::numeric_limits<int>::max();
 
-                return _add_rule(rule_name, "\"[\" space " + build_repetition(item_rule_name, min_items, max_items, "\",\" space") + " \"]\" space");
+                return add_rule(rule_name, "\"[\" space " + build_repetition(item_rule_name, min_items, max_items, "\",\" space") + " \"]\" space");
             }
         } else if ((schema_type.is_null() || schema_type == "string") && schema.contains("pattern")) {
             return _visit_pattern(schema["pattern"], rule_name);
@@ -981,32 +746,14 @@ public:
             return _add_primitive(rule_name == "root" ? "root" : schema_format, PRIMITIVE_RULES.at("uuid"));
         } else if ((schema_type.is_null() || schema_type == "string") && STRING_FORMAT_RULES.find(schema_format + "-string") != STRING_FORMAT_RULES.end()) {
             auto prim_name = schema_format + "-string";
-            return _add_rule(rule_name, _add_primitive(prim_name, STRING_FORMAT_RULES.at(prim_name)));
+            return add_rule(rule_name, _add_primitive(prim_name, STRING_FORMAT_RULES.at(prim_name)));
         } else if (schema_type == "string" && (schema.contains("minLength") || schema.contains("maxLength"))) {
             std::string char_rule = _add_primitive("char", PRIMITIVE_RULES.at("char"));
             int min_len = schema.contains("minLength") ? schema["minLength"].get<int>() : 0;
             int max_len = schema.contains("maxLength") ? schema["maxLength"].get<int>() : std::numeric_limits<int>::max();
-            return _add_rule(rule_name, "\"\\\"\" " + build_repetition(char_rule, min_len, max_len) + " \"\\\"\" space");
-        } else if (schema_type == "integer" && (schema.contains("minimum") || schema.contains("exclusiveMinimum") || schema.contains("maximum") || schema.contains("exclusiveMaximum"))) {
-            int min_value = std::numeric_limits<int>::min();
-            int max_value = std::numeric_limits<int>::max();
-            if (schema.contains("minimum")) {
-                min_value = schema["minimum"].get<int>();
-            } else if (schema.contains("exclusiveMinimum")) {
-                min_value = schema["exclusiveMinimum"].get<int>() + 1;
-            }
-            if (schema.contains("maximum")) {
-                max_value = schema["maximum"].get<int>();
-            } else if (schema.contains("exclusiveMaximum")) {
-                max_value = schema["exclusiveMaximum"].get<int>() - 1;
-            }
-            std::stringstream out;
-            out << "(";
-            _build_min_max_int(min_value, max_value, out);
-            out << ") space";
-            return _add_rule(rule_name, out.str());
+            return add_rule(rule_name, "\"\\\"\" " + build_repetition(char_rule, min_len, max_len) + " \"\\\"\" space");
         } else if (schema.empty() || schema_type == "object") {
-            return _add_rule(rule_name, _add_primitive("object", PRIMITIVE_RULES.at("object")));
+            return add_rule(rule_name, _add_primitive("object", PRIMITIVE_RULES.at("object")));
         } else {
             if (!schema_type.is_string() || PRIMITIVE_RULES.find(schema_type.get<std::string>()) == PRIMITIVE_RULES.end()) {
                 _errors.push_back("Unrecognized schema: " + schema.dump());
@@ -1040,6 +787,48 @@ std::string json_schema_to_grammar(const json & schema) {
     auto copy = schema;
     converter.resolve_refs(copy, "input");
     converter.visit(copy, "");
+    converter.check_errors();
+    return converter.format_grammar();
+}
+
+std::string tool_call_grammar(const json & tools, bool allow_parallel_calls, bool allow_content) {
+    SchemaConverter converter([](const std::string &) { return json::object(); }, /* dotall= */ false);
+    
+    std::vector<std::string> tool_rules;
+    
+    for (const auto & tool : tools) {
+        const auto & function = tool["function"];
+        std::string name = function["name"];
+        std::string description = function.contains("description") ? function["description"] : "";
+        auto parameters_copy = function["parameters"];
+        converter.resolve_refs(parameters_copy, name);
+
+        tool_rules.push_back(converter.visit(json {
+            {"type", "object"},
+            {"description", description},
+            {"properties", json {
+                {"name", json {{"const", name}}},
+                {"arguments", parameters_copy},
+            }},
+            {"required", json::array({"name", "arguments"})},
+        }, name + "-tool-call"));
+    }
+
+    converter.add_rule(
+        "root",
+        (allow_content ? converter.not_literal("<tool_call>") + " | " : "") +
+        build_repetition(
+            converter.add_rule(
+                "tool_call",
+                "\"<tool_call>\" (" 
+                + join(tool_rules.begin(), tool_rules.end(), " | ")
+                + ") \"</tool_call>\""
+            ),
+            allow_content ? 0 : 1,
+            allow_parallel_calls ? std::numeric_limits<int>::max() : 1,
+            " \"\\n\" "
+        ));
+
     converter.check_errors();
     return converter.format_grammar();
 }

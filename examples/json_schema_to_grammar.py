@@ -188,9 +188,9 @@ def _generate_min_max_int(min_value: Optional[int], max_value: Optional[int], ou
     raise RuntimeError("At least one of min_value or max_value must be set")
 
 class BuiltinRule:
-    def __init__(self, content: str, deps: list = None):
+    def __init__(self, content: str, deps: List[str]):
         self.content = content
-        self.deps = deps or []
+        self.deps = deps
 
 # Constraining spaces to prevent model "running away".
 SPACE_RULE = '| " " | "\\n" [ \\t]{0,20}'
@@ -248,7 +248,7 @@ class SchemaConverter:
 
     def _format_literal(self, literal):
         escaped = GRAMMAR_LITERAL_ESCAPE_RE.sub(
-            lambda m: GRAMMAR_LITERAL_ESCAPES.get(m.group(0)), literal
+            lambda m: GRAMMAR_LITERAL_ESCAPES[m.group(0)], literal
         )
         return f'"{escaped}"'
 
@@ -332,13 +332,13 @@ class SchemaConverter:
         self._rules[key] = rule
         return key
 
-    def resolve_refs(self, schema: dict, url: str):
+    def resolve_refs(self, schema: Any, url: str):
         '''
             Resolves all $ref fields in the given schema, fetching any remote schemas,
             replacing $ref with absolute reference URL and populating self._refs with the
             respective referenced (sub)schema dictionaries.
         '''
-        def visit(n: dict):
+        def visit(n: Any):
             if isinstance(n, list):
                 return [visit(x) for x in n]
             elif isinstance(n, dict):
@@ -398,7 +398,7 @@ class SchemaConverter:
 
         assert pattern.startswith('^') and pattern.endswith('$'), 'Pattern must start with "^" and end with "$"'
         pattern = pattern[1:-1]
-        sub_rule_ids = {}
+        sub_rule_ids: Dict[str, str] = {}
 
         i = 0
         length = len(pattern)
