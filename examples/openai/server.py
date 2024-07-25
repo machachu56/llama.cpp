@@ -67,7 +67,7 @@ def main(
             "--host", server_host, "--port", f'{server_port}',
             # TODO: pass these from JSON / BaseSettings?
             #'-ctk', 'q4_0', '-ctv', 'f16',
-            "-c", os.environ.get('CTX'), "-ngl", os.environ.get('GPULAYERS'), "-t", os.environ.get('THREADS'),
+            "-c", "vCONTEXT", "-ngl", "vGPULAYERS", "-t", "vTHREADS",
             *([] if verbose else ["--log-disable"]),
         ]
 
