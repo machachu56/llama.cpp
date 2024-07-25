@@ -1,7 +1,7 @@
 import json, sys
 from pathlib import Path
 import time
-
+import os
 from examples.openai.llama_cpp_server_api import LlamaCppServerCompletionRequest
 from examples.openai.gguf_kvs import GGUFKeyValues, Keys  # type: ignore
 from examples.openai.api import ChatCompletionResponse, Choice, ChatCompletionRequest, Usage
@@ -24,7 +24,7 @@ def main(
     model: Annotated[str, typer.Option("--model", "-m")] = "models/7B/ggml-model-f16.gguf",
     template_hf_model_id_fallback: Annotated[Optional[str], typer.Option(help="If the GGUF model does not contain a chat template, get it from this HuggingFace tokenizer")] = 'meta-llama/Llama-2-7b-chat-hf',
     # model_url: Annotated[Optional[str], typer.Option("--model-url", "-mu")] = None,
-    host: str = "localhost",
+    host: str = os.environ['HOST'] if 'HOST' in os.environ else "0.0.0.0",
     port: int = 8080,
     parallel_calls: bool = False,
     style: Optional[ToolsPromptStyle] = None,
@@ -66,8 +66,8 @@ def main(
             "./server", "-m", model,
             "--host", server_host, "--port", f'{server_port}',
             # TODO: pass these from JSON / BaseSettings?
-            '-ctk', 'q4_0', '-ctv', 'f16',
-            "-c", f"{context_length}",
+            #'-ctk', 'q4_0', '-ctv', 'f16',
+            "-c", os.environ['CTX'], "-ngl", os.environ['GPULAYERS'], "-t", os.environ['THREADS'],
             *([] if verbose else ["--log-disable"]),
         ]
 
