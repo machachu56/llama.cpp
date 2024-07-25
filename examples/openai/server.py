@@ -32,7 +32,7 @@ def main(
     verbose: bool = False,
     context_length: Optional[int] = None,
     endpoint: Optional[str] = None,
-    server_host: str = "localhost",
+    server_host: str = "0.0.0.0",
     server_port: Optional[int] = 8081,
 ):
     import uvicorn
@@ -67,7 +67,7 @@ def main(
             "--host", server_host, "--port", f'{server_port}',
             # TODO: pass these from JSON / BaseSettings?
             #'-ctk', 'q4_0', '-ctv', 'f16',
-            "-c", os.environ['CTX'], "-ngl", os.environ['GPULAYERS'], "-t", os.environ['THREADS'],
+            "-c", "16384", "-ngl", "0", "-t", "8",
             *([] if verbose else ["--log-disable"]),
         ]
 
