@@ -392,6 +392,21 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // DEAKE (Dynamic Expert-Aware KV Eviction) configuration
+        // Expert paging: decouple expert weights from persistent GPU residency
+        bool use_expert_paging;        // enable expert paging system
+        size_t expert_cache_bytes;     // GPU memory budget for expert cache (0 = auto)
+        size_t expert_cpu_cache_bytes; // CPU memory budget for expert cache (0 = 4x GPU budget)
+
+        // Heterogeneous KV cache: per-layer compression based on sensitivity calibration
+        bool use_heterogeneous_kv;     // enable per-layer heterogeneous KV compression
+        size_t kv_cache_budget_bytes;  // memory budget for KV cache (0 = auto)
+        const char * kv_sensitivity_file; // path to pre-computed sensitivity data (NULL = calibrate on first run)
+
+        // Expert prefetching: predict and prefetch experts for next token
+        bool use_expert_prefetch;      // enable async expert prefetching
+        int32_t expert_prefetch_k;     // number of experts to prefetch (0 = n_expert_used)
     };
 
     struct llama_model_tensor_override {
@@ -1580,6 +1595,45 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    //
+    // DEAKE (Dynamic Expert-Aware KV Eviction)
+    //
+
+    // Calibrate KV cache sensitivity for heterogeneous compression
+    // This analyzes which layers are most sensitive to KV cache compression
+    // calibration_prompt: text to use for calibration (NULL = use default)
+    // output_path: where to save sensitivity data (NULL = don't save)
+    LLAMA_API int32_t llama_kv_sensitivity_calibrate(
+            struct llama_context * ctx,
+            const char * calibration_prompt,
+            const char * output_path);
+
+    // Load pre-computed KV sensitivity data
+    LLAMA_API int32_t llama_kv_sensitivity_load(
+            struct llama_context * ctx,
+            const char * path);
+
+    // Get expert cache statistics
+    struct llama_expert_cache_stats_ext {
+        uint64_t n_hits;
+        uint64_t n_misses;
+        uint64_t n_evictions;
+        size_t   bytes_transferred;
+        size_t   gpu_usage_bytes;
+        size_t   gpu_capacity_bytes;
+        size_t   cpu_usage_bytes;
+        size_t   cpu_capacity_bytes;
+        size_t   disk_usage_bytes;
+        size_t   n_pages;
+    };
+
+    LLAMA_API struct llama_expert_cache_stats_ext llama_expert_cache_get_stats(
+            struct llama_context * ctx);
+
+    // Print expert cache statistics
+    LLAMA_API void llama_expert_cache_print_stats(
+            struct llama_context * ctx);
 
 #ifdef __cplusplus
 }

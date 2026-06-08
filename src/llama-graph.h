@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-kv-sensitivity.h"
 
 #include <cstdint>
 #include <vector>
@@ -603,6 +604,8 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    class llama_expert_cache     * expert_cache;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -827,6 +830,8 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
+    class llama_expert_cache * expert_cache;
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
@@ -997,6 +1002,21 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
                     int   il) const;
+
+    ggml_tensor * build_attn_hetero(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il,
+      const llama_kv_layer_config & config) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

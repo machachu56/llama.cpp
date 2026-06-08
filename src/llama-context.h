@@ -7,12 +7,18 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-expert-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <map>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <algorithm>
 
 struct llama_model;
 class llama_batch_allocr;
@@ -75,6 +81,9 @@ struct llama_context {
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
+
+    // DEAKE: get expert cache (may be nullptr if not enabled)
+    llama_expert_cache * get_expert_cache() const { return expert_cache.get(); }
 
     enum llama_pooling_type pooling_type() const;
 
@@ -375,4 +384,130 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    //
+    // expert prefetch and prediction (DEAKE Phase 3)
+    //
+
+    // Markov predictor for expert routing
+    // Tracks transition probabilities: P(expert_next | expert_current, layer)
+    struct expert_predictor {
+        static constexpr int MAX_EXPERTS = 256;
+        static constexpr int MAX_LAYERS = 128;
+
+        // transition_counts[layer][from_expert][to_expert]
+        std::vector<std::vector<std::vector<uint32_t>>> transition_counts;
+
+        // smoothing parameter for Laplace smoothing
+        float alpha = 1.0f;
+
+        int n_experts = 0;
+        int n_layers = 0;
+
+        void init(int n_exp, int n_lay) {
+            n_experts = n_exp;
+            n_layers = n_lay;
+            transition_counts.assign(n_layers,
+                std::vector<std::vector<uint32_t>>(n_experts,
+                    std::vector<uint32_t>(n_experts, 0)));
+        }
+
+        // Update transition counts after observing expert usage
+        void update(int layer, const std::vector<int32_t>& prev_experts,
+                    const std::vector<int32_t>& curr_experts) {
+            if (layer < 0 || layer >= n_layers) return;
+            for (int prev : prev_experts) {
+                if (prev < 0 || prev >= n_experts) continue;
+                for (int curr : curr_experts) {
+                    if (curr < 0 || curr >= n_experts) continue;
+                    transition_counts[layer][prev][curr]++;
+                }
+            }
+        }
+
+        // Predict top-k experts for next token given current experts
+        std::vector<int32_t> predict(int layer, const std::vector<int32_t>& curr_experts,
+                                     int top_k) const {
+            if (layer < 0 || layer >= n_layers || curr_experts.empty()) {
+                return {};
+            }
+
+            // Accumulate probabilities across all current experts
+            std::vector<float> scores(n_experts, 0.0f);
+
+            for (int curr : curr_experts) {
+                if (curr < 0 || curr >= n_experts) continue;
+
+                // Compute total count for normalization
+                uint32_t total = 0;
+                for (int e = 0; e < n_experts; e++) {
+                    total += transition_counts[layer][curr][e];
+                }
+
+                // Add Laplace-smoothed probabilities
+                float denom = total + alpha * n_experts;
+                for (int e = 0; e < n_experts; e++) {
+                    float prob = (transition_counts[layer][curr][e] + alpha) / denom;
+                    scores[e] += prob;
+                }
+            }
+
+            // Find top-k experts
+            std::vector<std::pair<float, int32_t>> scored;
+            scored.reserve(n_experts);
+            for (int e = 0; e < n_experts; e++) {
+                scored.emplace_back(scores[e], e);
+            }
+
+            std::partial_sort(scored.begin(),
+                             scored.begin() + std::min(top_k, (int)scored.size()),
+                             scored.end(),
+                             [](const auto& a, const auto& b) { return a.first > b.first; });
+
+            std::vector<int32_t> result;
+            result.reserve(std::min(top_k, (int)scored.size()));
+            for (int i = 0; i < std::min(top_k, (int)scored.size()); i++) {
+                result.push_back(scored[i].second);
+            }
+
+            return result;
+        }
+    };
+
+    // Expert cache for paging
+    std::unique_ptr<llama_expert_cache> expert_cache;
+
+    // Markov predictor instance
+    expert_predictor predictor;
+
+    // Previous token's expert selections per layer (for Markov updates)
+    std::vector<std::vector<int32_t>> prev_experts_per_layer;
+
+    // Prefetch thread infrastructure
+    std::thread prefetch_thread;
+    std::mutex prefetch_mutex;
+    std::condition_variable prefetch_cv;
+    std::condition_variable prefetch_done_cv;
+
+    std::atomic<bool> prefetch_stop{false};
+    std::atomic<bool> prefetch_pending{false};
+    std::atomic<bool> prefetch_complete{false};
+
+    // Pending prefetch request
+    struct prefetch_request {
+        std::vector<llama_expert_page_key> experts;
+        bool valid = false;
+    } pending_prefetch;
+
+    // Start the prefetch thread
+    void prefetch_thread_main();
+
+    // Trigger async prefetch for predicted experts
+    void trigger_prefetch(int layer, const std::vector<int32_t>& predicted_experts);
+
+    // Wait for pending prefetch to complete
+    void wait_for_prefetch();
+
+    // Initialize expert prediction system
+    void init_expert_prefetch(int n_experts, int n_layers, size_t gpu_budget_bytes);
 };

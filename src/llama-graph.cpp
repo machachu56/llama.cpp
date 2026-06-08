@@ -1043,6 +1043,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    expert_cache     (params.expert_cache),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -2331,6 +2332,123 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
+            cur = build_lora_mm(wo, cur);
+            ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+            if (wo_s) {
+                cur = ggml_mul(ctx0, cur, wo_s);
+            }
+        } else {
+            cur = build_lora_mm(wo, cur, wo_s);
+        }
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_hetero(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+            float     kq_scale,
+            int       il,
+  const llama_kv_layer_config & config) const {
+    GGML_ASSERT(v_mla == nullptr);
+
+    if (inp->self_k_rot) {
+        q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
+        k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
+    }
+
+    if (inp->self_v_rot) {
+        v_cur = ggml_mul_mat_aux(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    const float keep_ratio = config.keep_ratio;
+
+    if (keep_ratio < 1.0f) {
+        ggml_tensor * k_norm = ggml_l2_norm(ctx0, k, 1e-6f);
+        ggml_tensor * v_norm = ggml_l2_norm(ctx0, v, 1e-6f);
+        cb(k_norm, "hetero_k_norm", il);
+        cb(v_norm, "hetero_v_norm", il);
+
+        ggml_tensor * q_norm = ggml_l2_norm(ctx0, q, 1e-6f);
+        cb(q_norm, "hetero_q_norm", il);
+
+        ggml_tensor * q_perm = ggml_permute(ctx0, q_norm, 0, 2, 1, 3);
+        ggml_tensor * k_perm = ggml_permute(ctx0, k_norm, 0, 2, 1, 3);
+
+        ggml_tensor * qk_relevance = ggml_mul_mat(ctx0, k_perm, q_perm);
+        qk_relevance = ggml_mean(ctx0, qk_relevance);
+        cb(qk_relevance, "hetero_qk_relevance", il);
+
+        ggml_tensor * k_mag = ggml_mean(ctx0, k_norm);
+        ggml_tensor * v_mag = ggml_mean(ctx0, v_norm);
+        cb(k_mag, "hetero_k_mag", il);
+        cb(v_mag, "hetero_v_mag", il);
+
+        ggml_tensor * importance = ggml_add(ctx0, qk_relevance, k_mag);
+        importance = ggml_add(ctx0, importance, v_mag);
+        cb(importance, "hetero_importance", il);
+
+        const float evict_penalty = -10.0f * (1.0f - keep_ratio);
+        ggml_tensor * eviction_bias = ggml_scale(ctx0, importance, evict_penalty);
+        cb(eviction_bias, "hetero_eviction_bias", il);
+
+        ggml_tensor * kq_mask_f32 = kq_mask;
+        if (kq_mask->type != GGML_TYPE_F32) {
+            kq_mask_f32 = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+
+        ggml_tensor * modified_mask = ggml_add(ctx0, kq_mask_f32, eviction_bias);
+        cb(modified_mask, "hetero_modified_mask", il);
+
+        if (kq_mask->type != GGML_TYPE_F32) {
+            modified_mask = ggml_cast(ctx0, modified_mask, kq_mask->type);
+        }
+
+        kq_mask = modified_mask;
+    }
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    cb(cur, "kqv_out", il);
+
+    if (inp->self_v_rot) {
+        cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+    }
+
+    if (wo) {
+        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             cur = build_lora_mm(wo, cur);
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
             if (wo_s) {

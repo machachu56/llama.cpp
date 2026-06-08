@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-expert-cache.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -494,6 +495,15 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+
+    // Expert cache integration: ensure needed experts are in GPU memory
+    if (expert_cache) {
+        // For now, ensure all experts for this layer are resident
+        // In Phase 3, we'll use routing predictions to fetch only needed experts
+        for (int32_t e = 0; e < n_expert; ++e) {
+            expert_cache->fetch_expert(il, e);
+        }
+    }
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,

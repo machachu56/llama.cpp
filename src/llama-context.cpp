@@ -405,6 +405,17 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // Stop prefetch thread if running
+    if (prefetch_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(prefetch_mutex);
+            prefetch_stop = true;
+            prefetch_pending = true;
+        }
+        prefetch_cv.notify_one();
+        prefetch_thread.join();
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -2014,6 +2025,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    // Trigger expert prefetch for next token if expert cache is enabled
+    if (expert_cache && !prev_experts_per_layer.empty()) {
+        // Predict experts for layer 0 (first layer) for the next token
+        // This is a simplified approach - in production, we'd predict for all layers
+        // and use actual expert selections from the current forward pass
+        int n_predict = std::min(8, (int)model.hparams.n_expert_used);
+        auto predicted = predictor.predict(0, prev_experts_per_layer[0], n_predict);
+        if (!predicted.empty()) {
+            trigger_prefetch(0, predicted);
+        }
+    }
+
     return 0;
 }
 
@@ -2305,21 +2328,22 @@ llm_graph_params llama_context::graph_params(
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
     return {
-        /*.arch        =*/ model.arch,
-        /*.hparams     =*/ model.hparams,
-        /*.cparams     =*/ cparams,
-        /*.ubatch      =*/ ubatch,
-        /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
-        /*.backend_cpu =*/ backend_cpu,
-        /*.cvec        =*/ cvec.get(),
-        /*.loras       =*/ loras.get(),
-        /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.arch          =*/ model.arch,
+        /*.hparams       =*/ model.hparams,
+        /*.cparams       =*/ cparams,
+        /*.ubatch        =*/ ubatch,
+        /*.gtype         =*/ gtype,
+        /*.sched         =*/ sched.get(),
+        /*.backend_cpu   =*/ backend_cpu,
+        /*.cvec          =*/ cvec.get(),
+        /*.loras         =*/ loras.get(),
+        /*.mctx          =*/ mctx,
+        /*.cross         =*/ &cross,
+        /*.expert_cache  =*/ nullptr,
+        /*.samplers      =*/ sampling.samplers,
+        /*.n_outputs     =*/ n_outputs,
+        /*.cb            =*/ graph_get_cb(),
+        /*.res           =*/ res,
     };
 }
 
@@ -3387,6 +3411,15 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /* DEAKE fields */
+        /*.use_expert_paging           =*/ false,
+        /*.expert_cache_bytes          =*/ 0,
+        /*.expert_cpu_cache_bytes      =*/ 0,
+        /*.use_heterogeneous_kv        =*/ false,
+        /*.kv_cache_budget_bytes       =*/ 0,
+        /*.kv_sensitivity_file         =*/ nullptr,
+        /*.use_expert_prefetch         =*/ false,
+        /*.expert_prefetch_k           =*/ 0,
     };
 
     return result;
@@ -4028,4 +4061,208 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+//
+// expert prefetch (DEAKE Phase 3)
+//
+
+void llama_context::prefetch_thread_main() {
+    while (true) {
+        std::unique_lock<std::mutex> lock(prefetch_mutex);
+
+        // Wait for a prefetch request or stop signal
+        prefetch_cv.wait(lock, [this] {
+            return prefetch_pending.load() || prefetch_stop.load();
+        });
+
+        if (prefetch_stop.load()) {
+            break;
+        }
+
+        if (!pending_prefetch.valid || pending_prefetch.experts.empty()) {
+            prefetch_pending = false;
+            prefetch_complete = true;
+            prefetch_done_cv.notify_one();
+            continue;
+        }
+
+        // Perform the prefetch
+        auto experts_to_fetch = pending_prefetch.experts;
+        pending_prefetch.valid = false;
+        lock.unlock();
+
+        // Fetch experts asynchronously
+        if (expert_cache) {
+            for (const auto& key : experts_to_fetch) {
+                expert_cache->fetch_expert(key.layer_id, key.expert_id);
+            }
+        }
+
+        lock.lock();
+        prefetch_pending = false;
+        prefetch_complete = true;
+        prefetch_done_cv.notify_one();
+    }
+}
+
+void llama_context::trigger_prefetch(int layer, const std::vector<int32_t>& predicted_experts) {
+    if (!expert_cache || predicted_experts.empty()) {
+        return;
+    }
+
+    // Wait for any previous prefetch to complete
+    wait_for_prefetch();
+
+    {
+        std::lock_guard<std::mutex> lock(prefetch_mutex);
+
+        pending_prefetch.experts.clear();
+        for (int32_t expert_id : predicted_experts) {
+            pending_prefetch.experts.push_back({layer, expert_id});
+        }
+        pending_prefetch.valid = true;
+        prefetch_pending = true;
+        prefetch_complete = false;
+    }
+
+    prefetch_cv.notify_one();
+}
+
+void llama_context::wait_for_prefetch() {
+    std::unique_lock<std::mutex> lock(prefetch_mutex);
+    prefetch_done_cv.wait(lock, [this] {
+        return prefetch_complete.load() || !prefetch_pending.load();
+    });
+}
+
+void llama_context::init_expert_prefetch(int n_experts, int n_layers, size_t gpu_budget_bytes) {
+    LLAMA_LOG_INFO("%s: initializing expert prefetch system (experts=%d, layers=%d, gpu_budget=%.2f MB)\n",
+        __func__, n_experts, n_layers, gpu_budget_bytes / (1024.0 * 1024.0));
+
+    // Initialize predictor
+    predictor.init(n_experts, n_layers);
+
+    // Initialize previous experts tracking
+    prev_experts_per_layer.resize(n_layers);
+
+    // Initialize expert cache if not already done
+    if (!expert_cache && gpu_budget_bytes > 0) {
+        // Get GPU backend
+        ggml_backend_t backend_gpu = nullptr;
+        ggml_backend_buffer_type_t buft_gpu = nullptr;
+
+        for (auto& backend : backends) {
+            if (backend && !ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend.get()))) {
+                backend_gpu = backend.get();
+                buft_gpu = ggml_backend_get_default_buffer_type(backend.get());
+                break;
+            }
+        }
+
+        if (backend_gpu && buft_gpu) {
+            // Use 4x GPU budget for CPU backing store
+            size_t cpu_budget_bytes = gpu_budget_bytes * 4;
+            // No disk backing for now
+            std::string disk_path = "";
+
+            expert_cache = std::make_unique<llama_expert_cache>(
+                model, gpu_budget_bytes, cpu_budget_bytes, disk_path, buft_gpu, backend_gpu);
+
+            // Start prefetch thread
+            prefetch_stop = false;
+            prefetch_pending = false;
+            prefetch_complete = true;
+            prefetch_thread = std::thread(&llama_context::prefetch_thread_main, this);
+
+            LLAMA_LOG_INFO("%s: expert prefetch system initialized\n", __func__);
+        } else {
+            LLAMA_LOG_WARN("%s: no GPU backend found, expert prefetch disabled\n", __func__);
+        }
+    }
+}
+
+//
+// DEAKE API functions
+//
+
+int32_t llama_kv_sensitivity_calibrate(
+        struct llama_context * ctx,
+        const char * calibration_prompt,
+        const char * output_path) {
+    // TODO: Implement KV sensitivity calibration
+    // This would call into llama-kv-sensitivity.cpp
+    LLAMA_LOG_WARN("%s: not yet implemented\n", __func__);
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(calibration_prompt);
+    GGML_UNUSED(output_path);
+    return -1;
+}
+
+int32_t llama_kv_sensitivity_load(
+        struct llama_context * ctx,
+        const char * path) {
+    // TODO: Implement KV sensitivity loading
+    LLAMA_LOG_WARN("%s: not yet implemented\n", __func__);
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(path);
+    return -1;
+}
+
+struct llama_expert_cache_stats_ext llama_expert_cache_get_stats(
+        struct llama_context * ctx) {
+    struct llama_expert_cache_stats_ext stats = {};
+
+    auto * cache = ctx ? ctx->get_expert_cache() : nullptr;
+    if (cache) {
+        auto cache_stats = cache->get_stats();
+        stats.n_hits = cache_stats.n_hits;
+        stats.n_misses = cache_stats.n_misses;
+        stats.n_evictions = cache_stats.n_evictions;
+        stats.bytes_transferred = cache_stats.bytes_transferred;
+        stats.gpu_usage_bytes = cache->get_gpu_usage_bytes();
+        stats.gpu_capacity_bytes = cache->get_gpu_capacity_bytes();
+        stats.cpu_usage_bytes = cache->get_cpu_usage_bytes();
+        stats.cpu_capacity_bytes = cache->get_cpu_capacity_bytes();
+        stats.disk_usage_bytes = cache->get_disk_usage_bytes();
+        stats.n_pages = cache->get_n_pages();
+    }
+
+    return stats;
+}
+
+void llama_expert_cache_print_stats(struct llama_context * ctx) {
+    auto * cache = ctx ? ctx->get_expert_cache() : nullptr;
+    if (!cache) {
+        LLAMA_LOG_INFO("Expert cache: not enabled\n");
+        return;
+    }
+
+    auto stats = llama_expert_cache_get_stats(ctx);
+
+    LLAMA_LOG_INFO("\n");
+    LLAMA_LOG_INFO("=== Expert Cache Statistics ===\n");
+    LLAMA_LOG_INFO("  GPU usage:    %8.2f / %8.2f MB (%.1f%%)\n",
+        stats.gpu_usage_bytes / 1024.0 / 1024.0,
+        stats.gpu_capacity_bytes / 1024.0 / 1024.0,
+        stats.gpu_capacity_bytes > 0 ? 100.0 * stats.gpu_usage_bytes / stats.gpu_capacity_bytes : 0.0);
+    LLAMA_LOG_INFO("  CPU usage:    %8.2f / %8.2f MB (%.1f%%)\n",
+        stats.cpu_usage_bytes / 1024.0 / 1024.0,
+        stats.cpu_capacity_bytes / 1024.0 / 1024.0,
+        stats.cpu_capacity_bytes > 0 ? 100.0 * stats.cpu_usage_bytes / stats.cpu_capacity_bytes : 0.0);
+    LLAMA_LOG_INFO("  Disk usage:   %8.2f MB\n",
+        stats.disk_usage_bytes / 1024.0 / 1024.0);
+    LLAMA_LOG_INFO("  Pages:        %zu\n", stats.n_pages);
+    LLAMA_LOG_INFO("  Hits:         %lu\n", (unsigned long)stats.n_hits);
+    LLAMA_LOG_INFO("  Misses:       %lu\n", (unsigned long)stats.n_misses);
+    LLAMA_LOG_INFO("  Evictions:    %lu\n", (unsigned long)stats.n_evictions);
+    LLAMA_LOG_INFO("  Transferred:  %8.2f MB\n",
+        stats.bytes_transferred / 1024.0 / 1024.0);
+
+    uint64_t total_accesses = stats.n_hits + stats.n_misses;
+    if (total_accesses > 0) {
+        LLAMA_LOG_INFO("  Hit rate:     %.1f%%\n",
+            100.0 * stats.n_hits / total_accesses);
+    }
+    LLAMA_LOG_INFO("===============================\n\n");
 }
