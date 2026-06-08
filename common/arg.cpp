@@ -64,9 +64,35 @@ static std::string read_file(const std::string & fname) {
     if (!file) {
         throw std::runtime_error(string_format("error: failed to open file '%s'\n", fname.c_str()));
     }
-    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>(file));
     file.close();
     return content;
+}
+
+static size_t parse_size_string(const std::string & str) {
+    if (str.empty()) {
+        return 0;
+    }
+    char * end = nullptr;
+    double value = std::strtod(str.c_str(), &end);
+    if (end == str.c_str()) {
+        throw std::runtime_error(string_format("error: invalid size format: '%s'\n", str.c_str()));
+    }
+    std::string suffix(end);
+    std::transform(suffix.begin(), suffix.end(), suffix.begin(), ::toupper);
+    if (suffix.empty() || suffix == "B") {
+        return static_cast<size_t>(value);
+    } else if (suffix == "K" || suffix == "KB") {
+        return static_cast<size_t>(value * 1024);
+    } else if (suffix == "M" || suffix == "MB") {
+        return static_cast<size_t>(value * 1024 * 1024);
+    } else if (suffix == "G" || suffix == "GB") {
+        return static_cast<size_t>(value * 1024 * 1024 * 1024);
+    } else if (suffix == "T" || suffix == "TB") {
+        return static_cast<size_t>(value * 1024ULL * 1024 * 1024 * 1024);
+    } else {
+        throw std::runtime_error(string_format("error: unknown size suffix '%s' (use K, M, G, or T)\n", suffix.c_str()));
+    }
 }
 
 static const std::vector<common_arg> & get_common_arg_defs() {
@@ -1394,7 +1420,96 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                throw std::runtime_error(
                                    string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
                            }
-                       }).set_env("LLAMA_ARG_FLASH_ATTN"));
+                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
+    add_opt(common_arg(
+        {"--expert-paging"},
+        {"--no-expert-paging"},
+        "enable expert paging system (decouple expert weights from persistent GPU residency)",
+        [](common_params & params, bool value) {
+            params.use_expert_paging = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--expert-cache-gpu"}, "SIZE",
+        "GPU memory budget for expert cache (e.g. 8G, 512M; default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_bytes = parse_size_string(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--expert-cache-cpu"}, "SIZE",
+        "CPU memory budget for expert cache (e.g. 32G; default: 4x GPU budget)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cpu_cache_bytes = parse_size_string(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--heterogeneous-kv"},
+        {"--no-heterogeneous-kv"},
+        "enable per-layer heterogeneous KV compression based on sensitivity calibration",
+        [](common_params & params, bool value) {
+            params.use_heterogeneous_kv = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-budget"}, "SIZE",
+        "total memory budget for KV cache (e.g. 3G, 512M; default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.kv_cache_budget_bytes = parse_size_string(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-sensitivity-file"}, "PATH",
+        "path to pre-computed KV sensitivity data file",
+        [](common_params & params, const std::string & value) {
+            params.kv_sensitivity_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--calibrate-kv-sensitivity"},
+        {"--no-calibrate-kv-sensitivity"},
+        "run KV sensitivity calibration on startup",
+        [](common_params & params, bool value) {
+            params.calibrate_kv_sensitivity = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--calibration-prompt"}, "TEXT",
+        "text to use for KV sensitivity calibration",
+        [](common_params & params, const std::string & value) {
+            params.calibration_prompt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-sensitivity-output"}, "PATH",
+        "save calibration results to file",
+        [](common_params & params, const std::string & value) {
+            params.kv_sensitivity_output = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--expert-prefetch"},
+        {"--no-expert-prefetch"},
+        "enable asynchronous expert prefetching",
+        [](common_params & params, bool value) {
+            params.use_expert_prefetch = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--expert-prefetch-k"}, "N",
+        string_format("number of experts to prefetch (default: %d, 0 = n_expert_used)", params.expert_prefetch_k),
+        [](common_params & params, int value) {
+            params.expert_prefetch_k = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--expert-cache-stats"},
+        {"--no-expert-cache-stats"},
+        "print expert cache statistics on exit",
+        [](common_params & params, bool value) {
+            params.expert_cache_stats = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",

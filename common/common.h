@@ -565,6 +565,24 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // DEAKE (Dynamic Expert-Aware KV Eviction) configuration
+    bool use_expert_paging        = false; // enable expert paging system
+    size_t expert_cache_bytes     = 0;     // GPU memory budget for expert cache (0 = auto)
+    size_t expert_cpu_cache_bytes = 0;     // CPU memory budget for expert cache (0 = 4x GPU budget)
+
+    bool use_heterogeneous_kv    = false; // enable per-layer heterogeneous KV compression
+    size_t kv_cache_budget_bytes = 0;     // memory budget for KV cache (0 = auto)
+    std::string kv_sensitivity_file = ""; // path to pre-computed sensitivity data
+
+    bool use_expert_prefetch  = false; // enable async expert prefetching
+    int32_t expert_prefetch_k = 0;     // number of experts to prefetch (0 = n_expert_used)
+
+    bool calibrate_kv_sensitivity = false; // run calibration on startup
+    std::string calibration_prompt = "";   // text to use for calibration
+    std::string kv_sensitivity_output = ""; // save calibration results to file
+
+    bool expert_cache_stats = false; // print expert cache statistics on exit
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

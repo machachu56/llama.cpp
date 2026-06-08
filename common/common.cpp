@@ -1589,6 +1589,15 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    cparams.use_expert_paging        = params.use_expert_paging;
+    cparams.expert_cache_bytes       = params.expert_cache_bytes;
+    cparams.expert_cpu_cache_bytes   = params.expert_cpu_cache_bytes;
+    cparams.use_heterogeneous_kv     = params.use_heterogeneous_kv;
+    cparams.kv_cache_budget_bytes    = params.kv_cache_budget_bytes;
+    cparams.kv_sensitivity_file      = params.kv_sensitivity_file.empty() ? nullptr : params.kv_sensitivity_file.c_str();
+    cparams.use_expert_prefetch      = params.use_expert_prefetch;
+    cparams.expert_prefetch_k        = params.expert_prefetch_k;
+
     return cparams;
 }
 
