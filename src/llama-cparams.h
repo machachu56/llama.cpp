@@ -44,6 +44,10 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // DEAKE fields
+    bool   use_heterogeneous_kv;
+    size_t kv_cache_budget_bytes;
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 

@@ -1,6 +1,7 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 #include "llama-expert-cache.h"
+#include "llama-kv-sensitivity.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -341,10 +342,37 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-    cb(cur, "attn_pregate", il);
+    if (cparams.use_heterogeneous_kv) {
+        // Compute per-layer keep_ratio from the KV budget.
+        // If no budget is set, use a default keep_ratio of 0.75 (evict 25%).
+        float keep_ratio = 0.75f;
+        if (cparams.kv_cache_budget_bytes > 0) {
+            // Estimate full KV cache size per layer assuming q8_0 (1 byte/elem).
+            // Full: n_embd_head * n_head_kv * 2 (K+V) * n_ctx bytes per layer
+            size_t full_kv_per_layer = (size_t)n_embd_head * (size_t)n_head_kv * 2
+                * (size_t)cparams.n_ctx;
+            size_t total_full_kv = full_kv_per_layer * (size_t)hparams.n_layer();
+            if (total_full_kv > 0) {
+                float ratio = (float)cparams.kv_cache_budget_bytes / (float)total_full_kv;
+                keep_ratio = std::max(0.1f, std::min(1.0f, ratio));
+            }
+        }
+
+        llama_kv_layer_config config;
+        config.keep_ratio = keep_ratio;
+        config.k_bits = 16; // full precision for K (no quantization in attention)
+        config.v_bits = 16; // full precision for V
+
+        cur = build_attn_hetero(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il, config);
+        cb(cur, "attn_hetero_out", il);
+    } else {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cb(cur, "attn_pregate", il);
+    }
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);

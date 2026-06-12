@@ -199,6 +199,9 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    cparams.use_heterogeneous_kv  = params.use_heterogeneous_kv;
+    cparams.kv_cache_budget_bytes = params.kv_cache_budget_bytes;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
