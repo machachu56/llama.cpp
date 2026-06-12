@@ -2027,13 +2027,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // Trigger expert prefetch for next token if expert cache is enabled
     if (expert_cache && !prev_experts_per_layer.empty()) {
-        // Predict experts for layer 0 (first layer) for the next token
-        // This is a simplified approach - in production, we'd predict for all layers
-        // and use actual expert selections from the current forward pass
+        // Predict top n_expert_used experts for ALL layers, not just layer 0
         int n_predict = std::min(8, (int)model.hparams.n_expert_used);
-        auto predicted = predictor.predict(0, prev_experts_per_layer[0], n_predict);
-        if (!predicted.empty()) {
-            trigger_prefetch(0, predicted);
+        int n_layers = std::min((int)prev_experts_per_layer.size(), (int)model.hparams.n_layer());
+
+        for (int il = 0; il < n_layers; ++il) {
+            if (prev_experts_per_layer[il].empty()) {
+                continue;
+            }
+            auto predicted = predictor.predict(il, prev_experts_per_layer[il], n_predict);
+            if (!predicted.empty()) {
+                trigger_prefetch(il, predicted);
+            }
         }
     }
 
@@ -2339,7 +2344,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras         =*/ loras.get(),
         /*.mctx          =*/ mctx,
         /*.cross         =*/ &cross,
-        /*.expert_cache  =*/ nullptr,
+        /*.expert_cache  =*/ expert_cache.get(),
         /*.samplers      =*/ sampling.samplers,
         /*.n_outputs     =*/ n_outputs,
         /*.cb            =*/ graph_get_cb(),
@@ -3501,6 +3506,20 @@ llama_context * llama_init_from_model(
 
     try {
         auto * ctx = new llama_context(*model, params);
+
+        // Initialize DEAKE expert cache system if enabled
+        if (params.use_expert_paging || params.use_expert_prefetch) {
+            int n_experts = model->hparams.n_expert > 0
+                ? model->hparams.n_expert
+                : model->hparams.n_expert_used;
+            int n_layers = model->hparams.n_layer();
+            size_t gpu_budget = params.expert_cache_bytes > 0
+                ? params.expert_cache_bytes
+                : (params.use_expert_prefetch ? params.expert_cache_bytes : 0);
+
+            ctx->init_expert_prefetch(n_experts, n_layers, gpu_budget);
+        }
+
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
@@ -4147,7 +4166,7 @@ void llama_context::init_expert_prefetch(int n_experts, int n_layers, size_t gpu
     prev_experts_per_layer.resize(n_layers);
 
     // Initialize expert cache if not already done
-    if (!expert_cache && gpu_budget_bytes > 0) {
+    if (!expert_cache) {
         // Get GPU backend
         ggml_backend_t backend_gpu = nullptr;
         ggml_backend_buffer_type_t buft_gpu = nullptr;
@@ -4161,13 +4180,16 @@ void llama_context::init_expert_prefetch(int n_experts, int n_layers, size_t gpu
         }
 
         if (backend_gpu && buft_gpu) {
-            // Use 4x GPU budget for CPU backing store
-            size_t cpu_budget_bytes = gpu_budget_bytes * 4;
-            // No disk backing for now
+            // Expert cache GPU buffer is set to 0: the cache currently operates as a
+            // metadata tracker and prefetch coordinator. The MoE computation uses
+            // the model's original tensors directly. When full offloading integration
+            // is implemented, gpu_budget_bytes can be allocated here.
+            // CPU backing: allocate only enough for tracking, not full 32G.
+            size_t cpu_budget_bytes = gpu_budget_bytes;  // reasonable default
             std::string disk_path = "";
 
             expert_cache = std::make_unique<llama_expert_cache>(
-                model, gpu_budget_bytes, cpu_budget_bytes, disk_path, buft_gpu, backend_gpu);
+                model, 0, cpu_budget_bytes, disk_path, buft_gpu, backend_gpu);
 
             // Start prefetch thread
             prefetch_stop = false;

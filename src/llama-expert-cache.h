@@ -140,7 +140,6 @@ private:
     ggml_backend_buffer_ptr buf_gpu;
 
     ggml_context_ptr ctx_cpu;
-    ggml_backend_buffer_ptr buf_cpu;
 
     int disk_fd = -1;
     off_t disk_next_offset = 0;

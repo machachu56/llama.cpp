@@ -496,14 +496,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    // Expert cache integration: ensure needed experts are in GPU memory
-    if (expert_cache) {
-        // For now, ensure all experts for this layer are resident
-        // In Phase 3, we'll use routing predictions to fetch only needed experts
-        for (int32_t e = 0; e < n_expert; ++e) {
-            expert_cache->fetch_expert(il, e);
-        }
-    }
+    // Expert cache integration: prefetch predicted experts for this layer
+    // The Markov predictor in llama_context prefetches experts before graph
+    // construction, so experts are already in cache by the time we build FFN.
+    // We don't fetch here to avoid blocking graph construction with I/O.
+    // The computation uses the model's original expert tensors directly;
+    // the expert cache is a separate cache for future lookups.
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,

@@ -66,16 +66,8 @@ llama_expert_cache::llama_expert_cache(
             LLAMA_LOG_WARN("%s: failed to initialize ggml context for expert cache (CPU)\n", __func__);
             cpu_capacity_bytes = 0;
         } else {
-            auto buft_cpu = ggml_backend_cpu_buffer_type();
-            buf_cpu.reset(ggml_backend_buft_alloc_buffer(buft_cpu, cpu_budget_bytes));
-            if (!buf_cpu) {
-                LLAMA_LOG_WARN("%s: failed to allocate %.2f MB CPU buffer\n",
-                        __func__, cpu_budget_bytes / (1024.0 * 1024.0));
-                cpu_capacity_bytes = 0;
-            } else {
-                LLAMA_LOG_INFO("%s: allocated %.2f MB CPU buffer for expert cache\n",
-                        __func__, cpu_budget_bytes / (1024.0 * 1024.0));
-            }
+            LLAMA_LOG_INFO("%s: CPU buffer capacity set to %.2f MB (per-page malloc used)\n",
+                    __func__, cpu_budget_bytes / (1024.0 * 1024.0));
         }
     }
 
@@ -186,10 +178,6 @@ bool llama_expert_cache::allocate_page_gpu(llama_expert_page & page) {
 }
 
 bool llama_expert_cache::allocate_page_cpu(llama_expert_page & page) {
-    if (!buf_cpu) {
-        return false;
-    }
-
     const int32_t layer_id = page.key.layer_id;
     const int32_t expert_id = page.key.expert_id;
 
@@ -211,13 +199,15 @@ bool llama_expert_cache::allocate_page_cpu(llama_expert_page & page) {
     const size_t up_size   = n_ff_exp * n_embd * elem_size;
     const size_t down_size = n_embd * n_ff_exp * elem_size;
 
-    page.cpu_gate = ggml_backend_buffer_get_base(buf_cpu.get());
-    if (!page.cpu_gate) {
+    // Allocate separate CPU memory for each page (per-page malloc)
+    void * buf = malloc(gate_size + up_size + down_size);
+    if (!buf) {
         return false;
     }
 
-    page.cpu_up   = (uint8_t *) page.cpu_gate + gate_size;
-    page.cpu_down = (uint8_t *) page.cpu_up + up_size;
+    page.cpu_gate = buf;
+    page.cpu_up   = (uint8_t *) buf + gate_size;
+    page.cpu_down = (uint8_t *) buf + gate_size + up_size;
 
     page.size_bytes = gate_size + up_size + down_size;
     page.tier = LLAMA_EXPERT_TIER_CPU;
@@ -265,6 +255,9 @@ bool llama_expert_cache::allocate_page_disk(llama_expert_page & page) {
 }
 
 void llama_expert_cache::deallocate_page(llama_expert_page & page) {
+    if (page.cpu_gate) {
+        free(page.cpu_gate);
+    }
     page.gpu_gate = nullptr;
     page.gpu_up   = nullptr;
     page.gpu_down = nullptr;
@@ -339,9 +332,9 @@ bool llama_expert_cache::load_expert_to_cpu(llama_expert_page & page) {
     const uint8_t * up_src   = (const uint8_t *) layer.ffn_up_exps->data   + expert_id * expert_stride;
     const uint8_t * down_src = (const uint8_t *) layer.ffn_down_exps->data + expert_id * expert_stride;
 
-    const size_t gate_size = ggml_nbytes(page.gpu_gate);
-    const size_t up_size   = ggml_nbytes(page.gpu_up);
-    const size_t down_size = ggml_nbytes(page.gpu_down);
+    const size_t gate_size = n_ff_exp * n_embd * elem_size;
+    const size_t up_size   = n_ff_exp * n_embd * elem_size;
+    const size_t down_size = n_embd * n_ff_exp * elem_size;
 
     memcpy(page.cpu_gate, gate_src, gate_size);
     memcpy(page.cpu_up,   up_src,   up_size);
@@ -630,6 +623,7 @@ llama_expert_cache::fetch_result llama_expert_cache::fetch_expert(int32_t layer_
                 ggml_backend_tensor_set(page.gpu_gate, page.cpu_gate, 0, gate_size);
                 ggml_backend_tensor_set(page.gpu_up,   page.cpu_up,   0, up_size);
                 ggml_backend_tensor_set(page.gpu_down, page.cpu_down, 0, down_size);
+                free(page.cpu_gate);
                 page.cpu_gate = nullptr;
                 page.cpu_up   = nullptr;
                 page.cpu_down = nullptr;
