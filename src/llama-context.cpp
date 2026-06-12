@@ -3507,17 +3507,20 @@ llama_context * llama_init_from_model(
     try {
         auto * ctx = new llama_context(*model, params);
 
-        // Initialize DEAKE expert cache system if enabled
+        // Initialize DEAKE expert cache system only when a GPU budget is configured.
+        // Without a GPU budget, the cache cannot hold expert tensors and would
+        // add runtime overhead (ggml contexts, prefetch thread) with no benefit.
         if (params.use_expert_paging || params.use_expert_prefetch) {
-            int n_experts = model->hparams.n_expert > 0
-                ? model->hparams.n_expert
-                : model->hparams.n_expert_used;
-            int n_layers = model->hparams.n_layer();
-            size_t gpu_budget = params.expert_cache_bytes > 0
-                ? params.expert_cache_bytes
-                : (params.use_expert_prefetch ? params.expert_cache_bytes : 0);
+            size_t gpu_budget = params.expert_cache_bytes;
 
-            ctx->init_expert_prefetch(n_experts, n_layers, gpu_budget);
+            if (gpu_budget > 0) {
+                int n_experts = model->hparams.n_expert > 0
+                    ? model->hparams.n_expert
+                    : model->hparams.n_expert_used;
+                int n_layers = model->hparams.n_layer();
+
+                ctx->init_expert_prefetch(n_experts, n_layers, gpu_budget);
+            }
         }
 
         return ctx;
