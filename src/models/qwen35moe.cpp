@@ -496,25 +496,35 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    // Expert cache integration: prefetch predicted experts for this layer
-    // The Markov predictor in llama_context prefetches experts before graph
-    // construction, so experts are already in cache by the time we build FFN.
-    // We don't fetch here to avoid blocking graph construction with I/O.
-    // The computation uses the model's original expert tensors directly;
-    // the expert cache is a separate cache for future lookups.
+    // Expert cache integration: replace CPU-resident expert tensors with
+    // GPU-backed copies from the cache. When the model's expert tensors are
+    // offloaded to CPU (via --fit or buffer overrides), the cache provides
+    // GPU copies so the scheduler doesn't need to do its own CPU→GPU copies.
+    ggml_tensor * cur_gate_up = model.layers[il].ffn_gate_up_exps;
+    ggml_tensor * cur_down    = model.layers[il].ffn_down_exps;
+
+    if (expert_cache) {
+        ggml_tensor * cached_gate_up = expert_cache->get_layer_tensor(
+            model.layers[il].ffn_gate_up_exps, il, "gate_up_exps", ctx0);
+        ggml_tensor * cached_down = expert_cache->get_layer_tensor(
+            model.layers[il].ffn_down_exps, il, "down_exps", ctx0);
+
+        if (cached_gate_up) cur_gate_up = cached_gate_up;
+        if (cached_down)    cur_down    = cached_down;
+    }
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
             model.layers[il].ffn_up_exps,
             model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
+            cur_down,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
+            nullptr, cur_gate_up,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);

@@ -3509,7 +3509,7 @@ llama_context * llama_init_from_model(
 
         // Initialize DEAKE expert cache system only when a GPU budget is configured.
         // Without a GPU budget, the cache cannot hold expert tensors and would
-        // add runtime overhead (ggml contexts, prefetch thread) with no benefit.
+        // add runtime overhead with no benefit.
         if (params.use_expert_paging || params.use_expert_prefetch) {
             size_t gpu_budget = params.expert_cache_bytes;
 
@@ -3519,7 +3519,11 @@ llama_context * llama_init_from_model(
                     : model->hparams.n_expert_used;
                 int n_layers = model->hparams.n_layer();
 
-                ctx->init_expert_prefetch(n_experts, n_layers, gpu_budget);
+                size_t cpu_budget = params.expert_cpu_cache_bytes > 0
+                    ? params.expert_cpu_cache_bytes
+                    : gpu_budget;
+
+                ctx->init_expert_prefetch(n_experts, n_layers, gpu_budget, cpu_budget);
             }
         }
 
@@ -4158,9 +4162,10 @@ void llama_context::wait_for_prefetch() {
     });
 }
 
-void llama_context::init_expert_prefetch(int n_experts, int n_layers, size_t gpu_budget_bytes) {
-    LLAMA_LOG_INFO("%s: initializing expert prefetch system (experts=%d, layers=%d, gpu_budget=%.2f MB)\n",
-        __func__, n_experts, n_layers, gpu_budget_bytes / (1024.0 * 1024.0));
+void llama_context::init_expert_prefetch(int n_experts, int n_layers, size_t gpu_budget_bytes, size_t cpu_budget_bytes) {
+    LLAMA_LOG_INFO("%s: initializing expert prefetch system (experts=%d, layers=%d, gpu_budget=%.2f MB, cpu_budget=%.2f MB)\n",
+        __func__, n_experts, n_layers,
+        gpu_budget_bytes / (1024.0 * 1024.0), cpu_budget_bytes / (1024.0 * 1024.0));
 
     // Initialize predictor
     predictor.init(n_experts, n_layers);
@@ -4183,16 +4188,10 @@ void llama_context::init_expert_prefetch(int n_experts, int n_layers, size_t gpu
         }
 
         if (backend_gpu && buft_gpu) {
-            // Expert cache GPU buffer is set to 0: the cache currently operates as a
-            // metadata tracker and prefetch coordinator. The MoE computation uses
-            // the model's original tensors directly. When full offloading integration
-            // is implemented, gpu_budget_bytes can be allocated here.
-            // CPU backing: allocate only enough for tracking, not full 32G.
-            size_t cpu_budget_bytes = gpu_budget_bytes;  // reasonable default
             std::string disk_path = "";
 
             expert_cache = std::make_unique<llama_expert_cache>(
-                model, 0, cpu_budget_bytes, disk_path, buft_gpu, backend_gpu);
+                model, gpu_budget_bytes, cpu_budget_bytes, disk_path, buft_gpu, backend_gpu);
 
             // Start prefetch thread
             prefetch_stop = false;

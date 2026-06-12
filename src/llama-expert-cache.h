@@ -113,6 +113,16 @@ public:
 
     void clear();
 
+    // Per-layer full tensor caching (for ggml_mul_mat_id compatibility).
+    // Returns a GPU-backed tensor copy of the original, caching it across tokens.
+    // The returned tensor has identical shape/type to 'original' and lives in
+    // the cache's GPU buffer. Graph computation reads it directly — no extra copy.
+    ggml_tensor * get_layer_tensor(
+            const ggml_tensor * original,
+            int layer_id,
+            const char * name,
+            ggml_context * graph_ctx);
+
 private:
     const llama_model & model;
 
@@ -169,6 +179,20 @@ private:
 
     bool init_disk_storage();
     void close_disk_storage();
+
+    // Per-layer full tensor cache (GPU copies of entire expert tensors)
+    struct layer_tensor_entry {
+        ggml_tensor * gpu_tensor = nullptr;
+        std::string  cache_name;
+        size_t       size_bytes = 0;
+    };
+    std::unordered_map<std::string, layer_tensor_entry> layer_tensor_cache;
+    std::list<std::string> layer_tensor_lru;
+    std::unordered_map<std::string, std::list<std::string>::iterator> layer_tensor_lru_map;
+
+    ggml_tensor * allocate_layer_tensor(const ggml_tensor * original);
+    void evict_layer_tensors(size_t bytes_needed);
+    void touch_layer_tensor_lru(const std::string & key);
 };
 
 using llama_expert_cache_ptr = std::unique_ptr<llama_expert_cache>;

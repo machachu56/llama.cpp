@@ -1547,6 +1547,20 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
+    // DEAKE expert offloading: force expert FFN tensors to CPU so GPU VRAM
+    // is available for attention KV cache. The expert cache will provide GPU
+    // copies of these tensors on demand during graph building.
+    // Skip when --fit is active (it already handles MoE offloading).
+    if (params.use_expert_paging && params.expert_cache_bytes > 0 && !params.fit_params) {
+        static const llama_model_tensor_buft_override deake_expert_overrides[] = {
+            { "ffn_(gate|up|down|gate_up)_exps", nullptr },
+            { nullptr, nullptr },
+        };
+        // The buft pointer needs to be resolved at call time since it's a function
+        const_cast<llama_model_tensor_buft_override *>(deake_expert_overrides)[0].buft = ggml_backend_cpu_buffer_type();
+        mparams.tensor_buft_overrides = deake_expert_overrides;
+    }
+
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;

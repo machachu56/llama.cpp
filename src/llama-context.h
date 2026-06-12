@@ -255,7 +255,7 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
     // Initialize DEAKE expert prediction and prefetch system
-    void init_expert_prefetch(int n_experts, int n_layers, size_t gpu_budget_bytes);
+    void init_expert_prefetch(int n_experts, int n_layers, size_t gpu_budget_bytes, size_t cpu_budget_bytes);
 
     // Get the expert cache (for stats/external access)
     llama_expert_cache * get_expert_cache() { return expert_cache.get(); }

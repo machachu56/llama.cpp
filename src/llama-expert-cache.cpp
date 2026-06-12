@@ -828,4 +828,158 @@ void llama_expert_cache::clear() {
     gpu_usage_bytes = 0;
     cpu_usage_bytes = 0;
     disk_usage_bytes = 0;
+
+    // free layer tensor cache GPU memory
+    for (auto & [key, entry] : layer_tensor_cache) {
+        entry.gpu_tensor->data = nullptr;
+        entry.gpu_tensor = nullptr;
+    }
+    layer_tensor_cache.clear();
+    layer_tensor_lru.clear();
+    layer_tensor_lru_map.clear();
+}
+
+//
+// Per-layer full tensor caching (for ggml_mul_mat_id compatibility)
+//
+
+ggml_tensor * llama_expert_cache::allocate_layer_tensor(const ggml_tensor * original) {
+    if (!buf_gpu) {
+        return nullptr;
+    }
+
+    size_t nbytes = ggml_nbytes(original);
+    if (gpu_usage_bytes + nbytes > gpu_capacity_bytes) {
+        return nullptr;
+    }
+
+    const int64_t ne0 = original->ne[0];
+    const int64_t ne1 = original->ne[1];
+    const int64_t ne2 = original->ne[2];
+    const int64_t ne3 = original->ne[3];
+
+    ggml_tensor * t;
+    if (ne3 > 1) {
+        t = ggml_new_tensor_4d(ctx_gpu.get(), original->type, ne0, ne1, ne2, ne3);
+    } else if (ne2 > 1) {
+        t = ggml_new_tensor_3d(ctx_gpu.get(), original->type, ne0, ne1, ne2);
+    } else if (ne1 > 1) {
+        t = ggml_new_tensor_2d(ctx_gpu.get(), original->type, ne0, ne1);
+    } else {
+        t = ggml_new_tensor_1d(ctx_gpu.get(), original->type, ne0);
+    }
+
+    if (!t) {
+        return nullptr;
+    }
+
+    void * data = ggml_backend_buffer_get_base(buf_gpu.get());
+    if (!data) {
+        return nullptr;
+    }
+
+    char * ptr = (char *) data + gpu_usage_bytes;
+    t->data = ptr;
+    t->buffer = buf_gpu.get();
+
+    gpu_usage_bytes += nbytes;
+
+    return t;
+}
+
+void llama_expert_cache::evict_layer_tensors(size_t bytes_needed) {
+    // Simple generational eviction: if we need space and cache is full, clear everything.
+    // Per-layer tensors are large (hundreds of MB), so fragmentation is not a concern.
+    if (gpu_usage_bytes + bytes_needed <= gpu_capacity_bytes) {
+        return;
+    }
+
+    LLAMA_LOG_DEBUG("%s: clearing layer tensor cache (%.2f MB) for %.2f MB request\n",
+            __func__, gpu_usage_bytes / (1024.0 * 1024.0), bytes_needed / (1024.0 * 1024.0));
+
+    for (auto & [key, entry] : layer_tensor_cache) {
+        entry.gpu_tensor->data = nullptr;
+        entry.gpu_tensor = nullptr;
+        stats.n_evictions++;
+    }
+    layer_tensor_cache.clear();
+    layer_tensor_lru.clear();
+    layer_tensor_lru_map.clear();
+    gpu_usage_bytes = 0;
+}
+
+void llama_expert_cache::touch_layer_tensor_lru(const std::string & key) {
+    auto it = layer_tensor_lru_map.find(key);
+    if (it != layer_tensor_lru_map.end()) {
+        layer_tensor_lru.erase(it->second);
+        layer_tensor_lru.push_front(key);
+        it->second = layer_tensor_lru.begin();
+    }
+}
+
+ggml_tensor * llama_expert_cache::get_layer_tensor(
+        const ggml_tensor * original,
+        int layer_id,
+        const char * name,
+        ggml_context * /*graph_ctx*/) {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    if (gpu_capacity_bytes == 0 || !buf_gpu) {
+        return nullptr;
+    }
+
+    char key_buf[256];
+    snprintf(key_buf, sizeof(key_buf), "l%d_%s", layer_id, name);
+    std::string key(key_buf);
+
+    auto it = layer_tensor_cache.find(key);
+    if (it != layer_tensor_cache.end() && it->second.gpu_tensor && it->second.gpu_tensor->data) {
+        touch_layer_tensor_lru(key);
+        stats.n_hits++;
+        stats.n_gpu_hits++;
+        return it->second.gpu_tensor;
+    }
+
+    // Remove stale entry if tensor was invalidated
+    if (it != layer_tensor_cache.end()) {
+        layer_tensor_lru_map.erase(key);
+        layer_tensor_lru.erase(
+            std::find(layer_tensor_lru.begin(), layer_tensor_lru.end(), key));
+        layer_tensor_cache.erase(it);
+    }
+
+    stats.n_misses++;
+
+    size_t nbytes = ggml_nbytes(original);
+    if (nbytes > gpu_capacity_bytes) {
+        LLAMA_LOG_WARN("%s: tensor '%s' size %.2f MB exceeds cache capacity %.2f MB\n",
+                __func__, key.c_str(), nbytes / (1024.0 * 1024.0), gpu_capacity_bytes / (1024.0 * 1024.0));
+        return nullptr;
+    }
+
+    evict_layer_tensors(nbytes);
+
+    ggml_tensor * gpu_copy = allocate_layer_tensor(original);
+    if (!gpu_copy) {
+        LLAMA_LOG_WARN("%s: failed to allocate GPU tensor for '%s'\n", __func__, key.c_str());
+        return nullptr;
+    }
+
+    ggml_backend_tensor_set(gpu_copy, original->data, 0, nbytes);
+    stats.bytes_transferred += nbytes;
+
+    layer_tensor_entry entry;
+    entry.gpu_tensor = gpu_copy;
+    entry.cache_name = key;
+    entry.size_bytes = nbytes;
+
+    layer_tensor_cache[key] = entry;
+    layer_tensor_lru.push_front(key);
+    layer_tensor_lru_map[key] = layer_tensor_lru.begin();
+
+    LLAMA_LOG_DEBUG("%s: cached layer tensor '%s' (%.2f MB, GPU usage: %.2f / %.2f MB)\n",
+            __func__, key.c_str(), nbytes / (1024.0 * 1024.0),
+            gpu_usage_bytes / (1024.0 * 1024.0), gpu_capacity_bytes / (1024.0 * 1024.0));
+
+    return gpu_copy;
 }
