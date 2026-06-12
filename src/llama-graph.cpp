@@ -2397,6 +2397,12 @@ ggml_tensor * llm_graph_context::build_attn_hetero(
     const float keep_ratio = config.keep_ratio;
 
     if (keep_ratio < 1.0f) {
+        // TriAttention importance scoring requires Q and K to have matching
+        // token dimensions (prefill case). During decode, Q has 1 token but
+        // the KV cache has thousands — shapes can't broadcast, skip scoring.
+        const bool can_score = (q_cur->ne[2] == k->ne[2]);
+
+        if (can_score) {
         ggml_tensor * k_norm = ggml_l2_norm(ctx0, k, 1e-6f);
         ggml_tensor * v_norm = ggml_l2_norm(ctx0, v, 1e-6f);
         cb(k_norm, "hetero_k_norm", il);
@@ -2404,6 +2410,25 @@ ggml_tensor * llm_graph_context::build_attn_hetero(
 
         ggml_tensor * q_norm = ggml_l2_norm(ctx0, q, 1e-6f);
         cb(q_norm, "hetero_q_norm", il);
+
+        // Handle GQA: repeat K/V along head dim to match Q head count.
+        // Also flatten the seq dimension in K/V to match Q's 3D layout.
+        const int64_t n_head    = q->ne[1];
+        const int64_t n_head_kv = k->ne[1];
+        if (n_head != n_head_kv || k_norm->ne[3] != 1) {
+            // Flatten ne2*ne3 into ne2 for k/v so shapes match Q (3D)
+            k_norm = ggml_reshape_3d(ctx0, k_norm,
+                k_norm->ne[0], k_norm->ne[1], k_norm->ne[2] * k_norm->ne[3]);
+            v_norm = ggml_reshape_3d(ctx0, v_norm,
+                v_norm->ne[0], v_norm->ne[1], v_norm->ne[2] * v_norm->ne[3]);
+
+            if (n_head != n_head_kv) {
+                k_norm = ggml_repeat(ctx0, k_norm, q_norm);
+                v_norm = ggml_repeat(ctx0, v_norm, q_norm);
+                cb(k_norm, "hetero_k_norm_gqa", il);
+                cb(v_norm, "hetero_v_norm_gqa", il);
+            }
+        }
 
         ggml_tensor * q_perm = ggml_permute(ctx0, q_norm, 0, 2, 1, 3);
         ggml_tensor * k_perm = ggml_permute(ctx0, k_norm, 0, 2, 1, 3);
@@ -2438,6 +2463,7 @@ ggml_tensor * llm_graph_context::build_attn_hetero(
         }
 
         kq_mask = modified_mask;
+        } // can_score
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
