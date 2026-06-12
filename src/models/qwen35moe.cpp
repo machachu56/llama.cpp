@@ -497,20 +497,27 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
     // Expert cache integration: replace CPU-resident expert tensors with
-    // GPU-backed copies from the cache. When the model's expert tensors are
-    // offloaded to CPU (via --fit or buffer overrides), the cache provides
-    // GPU copies so the scheduler doesn't need to do its own CPU→GPU copies.
+    // GPU-backed copies from the cache. Only applies when the model's
+    // expert tensors are offloaded to CPU (via --fit or buffer overrides).
     ggml_tensor * cur_gate_up = model.layers[il].ffn_gate_up_exps;
     ggml_tensor * cur_down    = model.layers[il].ffn_down_exps;
 
-    if (expert_cache) {
-        ggml_tensor * cached_gate_up = expert_cache->get_layer_tensor(
-            model.layers[il].ffn_gate_up_exps, il, "gate_up_exps", ctx0);
-        ggml_tensor * cached_down = expert_cache->get_layer_tensor(
-            model.layers[il].ffn_down_exps, il, "down_exps", ctx0);
+    if (expert_cache && cur_gate_up) {
+        bool gate_up_on_host = cur_gate_up->buffer
+            && ggml_backend_buffer_is_host(cur_gate_up->buffer);
+        bool down_on_host = cur_down && cur_down->buffer
+            && ggml_backend_buffer_is_host(cur_down->buffer);
 
-        if (cached_gate_up) cur_gate_up = cached_gate_up;
-        if (cached_down)    cur_down    = cached_down;
+        if (gate_up_on_host) {
+            ggml_tensor * cached_gate_up = expert_cache->get_layer_tensor(
+                cur_gate_up, il, "gate_up_exps", ctx0);
+            if (cached_gate_up) cur_gate_up = cached_gate_up;
+        }
+        if (down_on_host) {
+            ggml_tensor * cached_down = expert_cache->get_layer_tensor(
+                cur_down, il, "down_exps", ctx0);
+            if (cached_down) cur_down = cached_down;
+        }
     }
 
     ggml_tensor * moe_out =

@@ -1552,13 +1552,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     // copies of these tensors on demand during graph building.
     // Skip when --fit is active (it already handles MoE offloading).
     if (params.use_expert_paging && params.expert_cache_bytes > 0 && !params.fit_params) {
-        static const llama_model_tensor_buft_override deake_expert_overrides[] = {
+        static llama_model_tensor_buft_override deake_expert_override[2] = {
             { "ffn_(gate|up|down|gate_up)_exps", nullptr },
             { nullptr, nullptr },
         };
-        // The buft pointer needs to be resolved at call time since it's a function
-        const_cast<llama_model_tensor_buft_override *>(deake_expert_overrides)[0].buft = ggml_backend_cpu_buffer_type();
-        mparams.tensor_buft_overrides = deake_expert_overrides;
+        deake_expert_override[0].buft = ggml_backend_cpu_buffer_type();
+        mparams.tensor_buft_overrides = deake_expert_override;
     }
 
     mparams.progress_callback           = params.load_progress_callback;
